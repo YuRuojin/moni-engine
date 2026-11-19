@@ -1,0 +1,13 @@
+{
+  "name": "moni-engine-scripts",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p examples/tsconfig.json",
+    "check": "tsc -p examples/tsconfig.json --noEmit",
+    "demo": "npm run build && cargo run -- demo"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}
