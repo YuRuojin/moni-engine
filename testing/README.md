@@ -34,15 +34,15 @@ SDK 稳定后，外部插件仓库应能复用生命周期、序列化、权限�
 npm run benchmark -- --label baseline --frames 600 --warmup 120
 ```
 
-该命令构建 release 二进制，从 `testing/assets/` 加载两个 FBX 和正交/透视 `.mnsc` 场景，依次运行逻辑帧和真实窗口渲染，把原始毫秒样本与 p50/p95/p99 写入 `target/benchmarks/baseline/`。逻辑帧指标包含 `Engine::step(1)` 和事件排空；渲染总耗时包含 present/垂直同步等待，准备耗时单独覆盖顶点、uniform、模型矩阵和 vertex buffer 操作。硬件支持时，主/阴影 pass 每 30 帧额外写入 GPU 时间戳；同步读回仅用于基准模式。
+该命令构建 release 二进制，先确保 `testing/assets/benchmark.mnec` 存在（约 198 万顶点的 cooked 网格，由 [`generate-fixture.cjs`](generate-fixture.cjs) 确定性生成，不入库），然后加载已入库的 [`benchmark-2d.mnsc`](assets/benchmark-2d.mnsc) 与 [`benchmark-3d.mnsc`](assets/benchmark-3d.mnsc) 场景，依次运行逻辑帧和真实窗口渲染，把原始毫秒样本与 p50/p95/p99 写入 `target/benchmarks/baseline/`。逻辑帧指标包含 `Engine::step(1)` 和事件排空；渲染总耗时包含 present/垂直同步等待，准备耗时单独覆盖顶点、uniform、模型矩阵和 vertex buffer 操作。硬件支持时，主/阴影 pass 每 30 帧额外写入 GPU 时间戳；同步读回仅用于基准模式。
 
 ## 资源与插件目录验证
 
-已验证异步 worker 预加载、运行时非阻塞接收、cooked 转换与 `.mnec` 场景加载；cooked 与 FBX 混用场景仍加载 1,975,083 顶点。FBX、wgpu、QuickJS 和 scene-viewer 实现已移入各自官方插件目录。
+已验证异步 worker 预加载、运行时非阻塞接收、cooked 转换与 `.mnec` 场景加载；基准场景加载 1,975,083 顶点的生成 cooked 网格。FBX、wgpu、QuickJS 和 scene-viewer 实现已移入各自官方插件目录。
 
 ## 独立项目验证
 
-已通过 `moni new` 创建独立 Git 工程，并从该工程目录完成 `npm ci`、TypeScript 构建、实际客户端运行、doctor 和 profile dump。锁文件被修改时 doctor 会拒绝，`doctor --update-lock` 修复后再次检查通过。
+`node testing/template-e2e.cjs` 自动执行完整验收：`moni new` 创建独立 Git 工程、校验结构与锁文件、确认仓库不含引擎绝对路径、`doctor` 与 `profile dump` 在工程目录内通过、`moni run --frames 3` 完成 `npm ci`、TypeScript 构建并实际运行窗口渲染、场景保存为 v2 `.mnsc`。可用 `MONI_E2E_SKIP_RUN=1` 跳过窗口运行，`--keep` 保留工程目录便于检查。锁文件被修改时 doctor 会拒绝，`doctor --update-lock` 修复后再次检查通过。
 
 ## Profile 组合验证
 
@@ -69,4 +69,4 @@ npm run test:soak
 
 ## 当前限制
 
-没有正式单元测试套件或完整第三方兼容认证服务；`cargo test` 当前只证明测试目标可以编译。CPU/GPU 基准、golden 和内存采样已建立，但没有多场景矩阵或跨平台基准。
+`cargo test` 提供针对性单元测试（profile 实例化回滚、权限授予/撤销、锁文件往返与回滚、路径校验、颜色解析缓存、模板初始化与路径隔离），模板端到端由 `template-e2e.cjs` 覆盖；仍无完整第三方兼容认证服务或 CI 接入。CPU/GPU 基准、golden 和内存采样已建立，但没有多场景矩阵或跨平台基准。

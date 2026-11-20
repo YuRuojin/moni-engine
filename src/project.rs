@@ -246,3 +246,95 @@ fn validate_relative_path(value: &str, field: &str) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_project() -> GameProject {
+        GameProject {
+            format: PROJECT_FORMAT.to_string(),
+            version: PROJECT_VERSION,
+            name: "sample".to_string(),
+            engine: env!("CARGO_PKG_VERSION").to_string(),
+            profile: "default".to_string(),
+            scene: "scenes/main.mnsc".to_string(),
+            plugins: Vec::new(),
+            patches: Vec::new(),
+            dependencies: BTreeMap::new(),
+        }
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("moni-project-test-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp root");
+        root
+    }
+
+    #[test]
+    fn lockfile_roundtrip_detects_drift_and_rolls_back() {
+        let project = sample_project();
+        let root = temp_root("lockfile");
+        project.write_lockfile(&root).expect("write lockfile");
+        project
+            .write_lockfile(&root)
+            .expect("rewrite creates a backup");
+        project
+            .check_lockfile(&root)
+            .expect("fresh lockfile passes");
+
+        let mut drifted = project.lock_value().expect("lock value");
+        drifted["plugins"]["core.render"]["permissions"] = json!([]);
+        fs::write(
+            root.join("moni.lock"),
+            serde_json::to_string_pretty(&drifted).expect("serialize drift") + "\n",
+        )
+        .expect("write drifted lockfile");
+        assert!(project.check_lockfile(&root).is_err());
+
+        project.rollback_lockfile(&root).expect("rollback");
+        project
+            .check_lockfile(&root)
+            .expect("rollback restores the lockfile");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn permission_diff_reports_added_permissions() {
+        let project = sample_project();
+        let root = temp_root("diff");
+        let mut stale = project.lock_value().expect("lock value");
+        stale["plugins"]["core.render"]["permissions"] = json!([]);
+        fs::write(
+            root.join("moni.lock"),
+            serde_json::to_string_pretty(&stale).expect("serialize stale") + "\n",
+        )
+        .expect("write stale lockfile");
+        let diff = project.permission_diff(&root).expect("permission diff");
+        let added = diff["added"]["core.render"].as_array().expect("added list");
+        assert!(
+            added.contains(&json!("gpu.create")),
+            "expected gpu.create in added permissions, got {added:?}"
+        );
+        assert!(
+            diff["removed"]
+                .as_object()
+                .expect("removed object")
+                .is_empty()
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn project_paths_must_stay_inside_the_project() {
+        let mut project = sample_project();
+        project.scene = "../outside.mnsc".to_string();
+        assert!(project.validate().is_err());
+        project.scene = "C:/outside.mnsc".to_string();
+        assert!(project.validate().is_err());
+        project.scene = "scenes/main.mnsc".to_string();
+        project.validate().expect("relative scene passes");
+    }
+}

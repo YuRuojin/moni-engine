@@ -109,6 +109,39 @@ pub fn load_scene(path: &Path) -> anyhow::Result<World> {
     Ok(world)
 }
 
+/// Validates scene structure without reading external script sources, so
+/// tools such as `moni doctor` can inspect a freshly created project before
+/// `npm run build` produces `build/*.js`. Returns the entity count.
+pub fn validate_scene_file(path: &Path) -> anyhow::Result<usize> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("could not read scene {}", path.display()))?;
+    let value: Value = serde_json::from_str(&contents)
+        .with_context(|| format!("could not parse scene {}", path.display()))?;
+    let value = migrate_scene(value)?;
+    let scene: SceneFile = serde_json::from_value(value)
+        .with_context(|| format!("invalid scene structure in {}", path.display()))?;
+    if scene.name.trim().is_empty() {
+        bail!("scene name must not be empty in {}", path.display());
+    }
+    let registry = ComponentRegistry::new();
+    for entity in &scene.entities {
+        if entity.id == 0 {
+            bail!("scene entity IDs must be positive in {}", path.display());
+        }
+        if entity.name.trim().is_empty() {
+            bail!("scene entity {} has an empty name", entity.id);
+        }
+        for (id, raw) in &entity.components {
+            if let Some(descriptor) = registry.resolve(id) {
+                descriptor
+                    .deserialize(raw)
+                    .map_err(|error| anyhow::anyhow!("component '{id}': {error}"))?;
+            }
+        }
+    }
+    Ok(scene.entities.len())
+}
+
 pub fn save_scene(world: &World, name: &str, path: &Path) -> anyhow::Result<()> {
     let value = scene_value(world, name)?;
     if let Some(parent) = path.parent() {

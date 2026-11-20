@@ -296,6 +296,7 @@ struct ClientApp {
     warmup_frames: u64,
     frame_samples: Vec<f64>,
     preparation_samples: Vec<f64>,
+    title_state: Option<(u64, usize, usize)>,
     failure: Option<anyhow::Error>,
 }
 
@@ -333,6 +334,7 @@ impl ClientApp {
             warmup_frames,
             frame_samples: Vec::with_capacity(sample_capacity),
             preparation_samples: Vec::with_capacity(sample_capacity),
+            title_state: None,
             failure: None,
         })
     }
@@ -436,12 +438,18 @@ impl ApplicationHandler for ClientApp {
                     return;
                 }
                 let events = self.host.take_events();
-                window.set_title(&format!(
-                    "Moni Engine | tick {} | entities {} | events {}",
+                let title_state = (
                     self.host.world().tick,
                     self.host.world().entities.len(),
-                    events.len()
-                ));
+                    events.len(),
+                );
+                if self.title_state != Some(title_state) {
+                    self.title_state = Some(title_state);
+                    window.set_title(&format!(
+                        "Moni Engine | tick {} | entities {} | events {}",
+                        title_state.0, title_state.1, title_state.2
+                    ));
+                }
                 let started = self.collect_benchmark.then(Instant::now);
                 match self.host.run_stage(SystemStage::Render) {
                     Ok(()) => match self.host.last_render_status() {

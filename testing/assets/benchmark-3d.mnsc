@@ -1,0 +1,46 @@
+{
+  "format": "moni-scene",
+  "version": 2,
+  "name": "benchmark-3d",
+  "viewport": { "width": 1280, "height": 720, "background": "#0d1220" },
+  "camera": {
+    "projection": "perspective",
+    "orthographic_height": 6.0,
+    "position": { "x": 35.0, "y": 25.0, "z": 35.0 },
+    "target": { "x": 0.0, "y": 0.0, "z": 0.0 },
+    "fov_y": 0.7853981633974483,
+    "near": 0.1,
+    "far": 300.0
+  },
+  "lights": [
+    {
+      "type": "directional",
+      "direction": { "x": -0.45, "y": -0.8, "z": -0.35 },
+      "color": [1.0, 0.96, 0.9],
+      "intensity": 1.0,
+      "shadows": true
+    }
+  ],
+  "extensions": {},
+  "entities": [
+    {
+      "id": 1,
+      "name": "benchmark-terrain",
+      "components": {
+        "core.transform": { "x": 0.0, "y": 0.0, "rotation": 0.0 },
+        "core.model": {
+          "type": "fbx",
+          "source": "testing/assets/benchmark.mnec",
+          "transform": {
+            "position": { "x": 0.0, "y": 0.0, "z": 0.0 },
+            "rotation": { "x": 0.0, "y": 0.0, "z": 0.0 },
+            "scale": { "x": 1.0, "y": 1.0, "z": 1.0 }
+          },
+          "color": "#9fb4ff",
+          "metallic": 0.1,
+          "roughness": 0.6
+        }
+      }
+    }
+  ]
+}

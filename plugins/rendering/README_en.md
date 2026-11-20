@@ -2,7 +2,7 @@
 
 [中文](README.md) | English
 
-`rendering/` turns scene data into images through replaceable render pipelines, materials, lighting, shadows, post-processing, and visual extensions for render debugging. The current 2D/3D code still lives in `src/gpu.rs` and the WGSL files; it has not been extracted into independent plugins.
+`rendering/` turns scene data into images through replaceable render pipelines, materials, lighting, shadows, post-processing, and visual extensions for render debugging. The current wgpu implementation lives in [`wgpu/`](wgpu/README.md) (`mod.rs` plus the WGSL shaders), already organized under the official plugin directories but still statically compiled into the main crate via `#[path]`; dynamic loading and a stable ABI are not implemented yet.
 
 ## Responsibility boundary
 

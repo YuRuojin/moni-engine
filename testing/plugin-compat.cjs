@@ -50,23 +50,32 @@ verify("headless-and-minimal", () => {
 });
 
 verify("permission-denial", () => {
-  const output = run(["client", "--revoke", "core.render=gpu.create", "--frames", "1"], 1);
+  // --world keeps this case independent of the example script build output.
+  const output = run(["client", "--revoke", "core.render=gpu.create", "--world", "testing/assets/benchmark-3d.mnsc", "--frames", "1"], 1);
   if (!output.includes("lacks required permission")) throw new Error("permission denial was not explicit");
 });
 
 verify("scene-v2-roundtrip", () => {
   const output = path.join("target", "testing", "compat-roundtrip.mnsc");
-  json(["scene", "testing/assets/perspective.mnsc", "--output", output, "--name", "compat"]);
+  json(["scene", "testing/assets/benchmark-3d.mnsc", "--output", output, "--name", "compat"]);
   const scene = JSON.parse(fs.readFileSync(output, "utf8"));
   if (scene.version !== 2 || !scene.entities[0].components["core.model"]) throw new Error("scene migration failed");
 });
 
 verify("corrupt-input-isolation", () => {
-  const valid = fs.readFileSync("testing/assets/garden_diorama.fbx");
+  // A real FBX gives the best truncation fixture when present; otherwise a
+  // synthetic binary-FBX header keeps the case self-contained.
+  const fixtureSource = fs.existsSync("testing/assets/garden_diorama.fbx")
+    ? fs.readFileSync("testing/assets/garden_diorama.fbx")
+    : Buffer.concat([
+        Buffer.from("Kaydara FBX Binary  \0\x1a\0", "latin1"),
+        Buffer.from([0x28, 0x00, 0x00, 0x00]), // version 7400
+        Buffer.alloc(160, 0x41),
+      ]);
   const fixtures = [
     Buffer.alloc(0),
     Buffer.from("not an fbx file"),
-    valid.subarray(0, 128),
+    fixtureSource.subarray(0, 128),
   ];
   fixtures.forEach((contents, index) => {
     const input = path.join("target", "testing", `corrupt-${index}.fbx`);

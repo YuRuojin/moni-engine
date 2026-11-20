@@ -18,7 +18,7 @@ GPU upload and material use belong to [`rendering/`](../rendering/README_en.md);
 
 ## Initial official capabilities
 
-The current static FBX importer in `src/fbx.rs` supports geometry triangulation, normals, node transforms, material base colors, coordinate/unit conversion, and normalization by maximum extent. Extract it into a formal format provider later, then unify asset identities, import results, textures, and other model formats.
+The current static FBX importer in [`fbx/`](fbx/README_en.md) supports geometry triangulation, normals, node transforms, material base colors, coordinate/unit conversion, and normalization by maximum extent. Extract it into a formal format provider later, then unify asset identities, import results, textures, and other model formats.
 
 ## Performance and stability
 
@@ -34,4 +34,4 @@ The current static FBX importer in `src/fbx.rs` supports geometry triangulation,
 - [`runtime/`](runtime/README_en.md): bounded asynchronous loading, shared references, cancellation, timeout, and caching.
 - [`cooked/`](cooked/README_en.md): `.mnec` static geometry I/O and FBX conversion.
 
-Initialization preloads through the same worker, while new models arrive through nonblocking `poll`. There is no asset database, textures, animation, virtual resource paths, persistent import cache, dependency graph, or complete asset package; cooked files are still read individually.
+Initialization preloads through the same worker, while new models arrive through nonblocking `poll`. There is no asset database, textures, animation, virtual resource paths, persistent import cache, dependency graph, hot reload, or complete asset package; cooked files are still read individually.

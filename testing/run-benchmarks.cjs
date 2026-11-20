@@ -34,6 +34,10 @@ function run(command, args, capture = false) {
 
 run("cargo", ["build", "--release"]);
 const executable = path.join("target", "release", `moni-engine${process.platform === "win32" ? ".exe" : ""}`);
+const fixture = path.join("testing", "assets", "benchmark.mnec");
+if (!fs.existsSync(fixture)) {
+  run(process.execPath, [path.join("testing", "generate-fixture.cjs")]);
+}
 const directory = path.join("target", "benchmarks", label);
 fs.mkdirSync(directory, { recursive: true });
 const results = [];

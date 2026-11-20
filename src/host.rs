@@ -154,6 +154,7 @@ pub trait Plugin: Any {
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
+#[derive(Debug)]
 pub struct PluginHandle {
     id: &'static str,
 }
@@ -207,6 +208,10 @@ impl PluginHost {
 
     pub fn grant_permissions(&mut self, plugin_id: &str, permissions: &[String]) {
         self.permissions.grant(plugin_id, permissions);
+    }
+
+    pub fn revoke_permissions(&mut self, plugin_id: &str) {
+        self.permissions.revoke(plugin_id);
     }
 
     pub fn register_plugin_with_permissions(
@@ -357,6 +362,46 @@ impl PluginHost {
 impl Drop for PluginHost {
     fn drop(&mut self) {
         let _ = self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::Engine;
+    use crate::plugins::SimulationPlugin;
+
+    #[test]
+    fn duplicate_plugin_registration_is_rejected() {
+        let mut host = PluginHost::new(Engine::new());
+        let permissions = ["script.execute".to_string()];
+        let first = host.register_plugin_with_permissions(Box::new(SimulationPlugin), &permissions);
+        assert!(first.is_ok());
+        let second =
+            host.register_plugin_with_permissions(Box::new(SimulationPlugin), &permissions);
+        assert!(second.is_err(), "duplicate plugin ID must be rejected");
+        let mut handles = vec![first.expect("first registration")];
+        while let Some(handle) = handles.pop() {
+            handle.dispose(&mut host).expect("dispose plugin");
+        }
+        assert!(!host.has_plugin("core.simulation"));
+    }
+
+    #[test]
+    fn permission_grants_can_be_revoked() {
+        let mut host = PluginHost::new(Engine::new());
+        host.grant_permissions("core.fbx", &["asset.read.workspace".to_string()]);
+        assert!(
+            host.permissions
+                .require("core.fbx", "asset.read.workspace")
+                .is_ok()
+        );
+        host.revoke_permissions("core.fbx");
+        assert!(
+            host.permissions
+                .require("core.fbx", "asset.read.workspace")
+                .is_err()
+        );
     }
 }
 

@@ -324,7 +324,7 @@ fn project_doctor(args: Vec<String>) -> anyhow::Result<()> {
         project.check_lockfile(&root)?;
     }
     let scene_path = project.scene_path(&root)?;
-    let world = scene::load_scene(&scene_path)?;
+    let entities = scene::validate_scene_file(&scene_path)?;
     let effective = project.profile()?.resolve(&profile::Target::current())?;
     println!(
         "{}",
@@ -332,7 +332,7 @@ fn project_doctor(args: Vec<String>) -> anyhow::Result<()> {
             "ok": true,
             "project": project.name,
             "engine": project.engine,
-            "entities": world.entities.len(),
+            "entities": entities,
             "plugins": effective.manifests().count(),
             "lockUpdated": update_lock,
             "lockRolledBack": rollback_lock,
@@ -360,7 +360,7 @@ fn run_project_command(root: &Path, command: &str, args: &[&str]) -> anyhow::Res
 
 fn headless(args: Vec<String>) -> anyhow::Result<()> {
     let mut profile_name = "headless".to_string();
-    let mut scene_path = "testing/assets/perspective.mnsc".to_string();
+    let mut scene_path = "testing/assets/benchmark-3d.mnsc".to_string();
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -638,11 +638,11 @@ fn demo(args: Vec<String>) -> anyhow::Result<()> {
 }
 
 pub(crate) fn demo_engine(source: String) -> anyhow::Result<Engine> {
-    external_model_engine(source, "testing/assets/orthographic.mnsc")
+    external_model_engine(source, "testing/assets/benchmark-2d.mnsc")
 }
 
 pub(crate) fn demo_engine_3d(source: String) -> anyhow::Result<Engine> {
-    external_model_engine(source, "testing/assets/perspective.mnsc")
+    external_model_engine(source, "testing/assets/benchmark-3d.mnsc")
 }
 
 fn external_model_engine(_source: String, scene_path: &str) -> anyhow::Result<Engine> {
@@ -668,4 +668,100 @@ fn workspace_path(raw_path: &str) -> anyhow::Result<PathBuf> {
         bail!("paths must stay inside the current workspace");
     }
     Ok(env::current_dir()?.join(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_root(label: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("moni-template-test-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp root");
+        root
+    }
+
+    fn collect_files(root: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(root).expect("read dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|name| name == ".git") {
+                    continue;
+                }
+                collect_files(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Detects `E:\path` / `E:/path` drive paths while ignoring URL schemes
+    /// such as `https://registry.npmjs.org` in lockfiles.
+    fn contains_drive_path(value: &str) -> bool {
+        let bytes = value.as_bytes();
+        for index in 0..bytes.len().saturating_sub(2) {
+            if bytes[index].is_ascii_alphabetic()
+                && bytes[index + 1] == b':'
+                && (bytes[index + 2] == b'/' || bytes[index + 2] == b'\\')
+                && bytes.get(index + 3) != Some(&b'/')
+                && bytes.get(index + 3) != Some(&b'\\')
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn new_creates_independent_project_without_engine_paths() {
+        let root = temp_root("independent");
+        initialize_project(&root).expect("initialize project");
+        assert!(root.join("game.mngp").is_file());
+        assert!(root.join("moni.lock").is_file());
+        assert!(root.join("scenes/main.mnsc").is_file());
+        assert!(root.join("scripts/main.ts").is_file());
+        assert!(root.join(".git").is_dir());
+
+        let expected_name = root
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("temp root has a name")
+            .to_string();
+        let project = project::GameProject::load(&root).expect("load generated project");
+        assert_eq!(project.name, expected_name);
+        project.check_lockfile(&root).expect("fresh lockfile");
+
+        let mut files = Vec::new();
+        collect_files(&root, &mut files);
+        assert!(!files.is_empty());
+        for file in files {
+            let extension = file.extension().and_then(|value| value.to_str());
+            if matches!(
+                extension,
+                Some("exe") | Some("dll") | Some("png") | Some("ico")
+            ) {
+                continue;
+            }
+            let contents = std::fs::read_to_string(&file).expect("template files are text");
+            for needle in [
+                "CARGO_MANIFEST_DIR",
+                "moni-engine",
+                "workspace\\code",
+                "workspace/code",
+            ] {
+                assert!(
+                    !contents.contains(needle),
+                    "{} references engine path '{needle}'",
+                    file.display()
+                );
+            }
+            assert!(
+                !contains_drive_path(&contents),
+                "{} contains an absolute Windows drive path",
+                file.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

@@ -34,15 +34,15 @@ Once the SDK stabilizes, external plugin repositories should reuse lifecycle, se
 npm run benchmark -- --label baseline --frames 600 --warmup 120
 ```
 
-The command builds a release binary, loads two FBX files and orthographic/perspective `.mnsc` scenes from `testing/assets/`, runs simulation and real window rendering, and writes raw millisecond samples plus p50/p95/p99 under `target/benchmarks/baseline/`. Simulation measures `Engine::step(1)` and event draining. Total render time includes present/vsync waits; preparation separately covers vertices, uniforms, model matrices, and vertex-buffer operations. When supported, main/shadow-pass GPU timestamps are sampled every 30 frames; synchronous readback is used only for benchmarks.
+The command builds a release binary, first makes sure `testing/assets/benchmark.mnec` exists (a ~1.98M-vertex cooked mesh generated deterministically by [`generate-fixture.cjs`](generate-fixture.cjs), kept out of Git), then loads the committed [`benchmark-2d.mnsc`](assets/benchmark-2d.mnsc) and [`benchmark-3d.mnsc`](assets/benchmark-3d.mnsc) scenes, runs simulation and real window rendering, and writes raw millisecond samples plus p50/p95/p99 under `target/benchmarks/baseline/`. Simulation measures `Engine::step(1)` and event draining. Total render time includes present/vsync waits; preparation separately covers vertices, uniforms, model matrices, and vertex-buffer operations. When supported, main/shadow-pass GPU timestamps are sampled every 30 frames; synchronous readback is used only for benchmarks.
 
 ## Asset and plugin-directory verification
 
-Asynchronous worker preload, nonblocking runtime collection, cooked conversion, and `.mnec` scene loading are verified. A mixed cooked/FBX scene still loads 1,975,083 vertices. FBX, wgpu, QuickJS, and scene-viewer implementations now live in their official plugin directories.
+Asynchronous worker preload, nonblocking runtime collection, cooked conversion, and `.mnec` scene loading are verified. The benchmark scene loads the generated 1,975,083-vertex cooked mesh. FBX, wgpu, QuickJS, and scene-viewer implementations now live in their official plugin directories.
 
 ## Independent project verification
 
-`moni new` created an independent Git project, which completed `npm ci`, TypeScript build, real client startup, doctor, and profile dump from its own directory. Doctor rejected a modified lockfile, then `doctor --update-lock` repaired it and verification passed again.
+`node testing/template-e2e.cjs` runs the full acceptance flow: `moni new` creates an independent Git project, verifies structure and lockfile, confirms the repository references no absolute engine paths, `doctor` and `profile dump` pass inside the project, `moni run --frames 3` completes `npm ci`, the TypeScript build, and a real windowed run, and the scene saves back as a v2 `.mnsc`. Set `MONI_E2E_SKIP_RUN=1` to skip the windowed run and pass `--keep` to inspect the project afterwards. Doctor rejects a modified lockfile, then `doctor --update-lock` repairs it and verification passes again.
 
 ## Profile composition verification
 
@@ -69,4 +69,4 @@ Golden captures use raw RGBA pixels and JSON metadata, without a cross-GPU toler
 
 ## Current limitations
 
-There is no formal unit test suite or full third-party certification service; `cargo test` currently proves only that the test target compiles. CPU/GPU benchmarks, golden captures, and memory sampling exist, but a scene matrix and cross-platform benchmarks do not.
+`cargo test` provides targeted unit tests (profile instantiation rollback, permission grant/revoke, lockfile round-trip and rollback, path validation, the color parse cache, and template initialization with path isolation), and the template flow is covered end to end by `template-e2e.cjs`; a full third-party certification service and CI wiring do not exist yet. CPU/GPU benchmarks, golden captures, and memory sampling exist, but a scene matrix and cross-platform benchmarks do not.

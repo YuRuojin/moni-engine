@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,6 +19,7 @@ const INITIAL_SPRITE_VERTEX_CAPACITY: usize = 1_024;
 const INITIAL_MESH_VERTEX_CAPACITY: usize = 512;
 const SHADOW_MAP_SIZE: u32 = 1_024;
 const MAX_POINT_LIGHTS: usize = 8;
+const MAX_CACHED_COLORS: usize = 4_096;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -191,6 +192,8 @@ pub struct GpuRenderer {
     mesh_vertex_capacity: usize,
     fbx_meshes: BTreeMap<String, Arc<FbxMesh>>,
     assets: AssetRuntime,
+    color_cache: ColorCache,
+    failed_assets: BTreeSet<String>,
     load_fbx_assets: bool,
     gpu_timing: Option<GpuTiming>,
     gpu_samples: Vec<(f32, f32)>,
@@ -631,6 +634,8 @@ impl GpuRenderer {
             mesh_vertex_capacity: INITIAL_MESH_VERTEX_CAPACITY,
             fbx_meshes: BTreeMap::new(),
             assets: AssetRuntime::new(),
+            color_cache: ColorCache::default(),
+            failed_assets: BTreeSet::new(),
             load_fbx_assets,
             gpu_timing,
             gpu_samples: Vec::new(),
@@ -824,16 +829,18 @@ impl GpuRenderer {
                 *references.entry(source.clone()).or_insert(0) += 1;
             }
         }
-        self.assets.set_references(references.clone())?;
         self.fbx_meshes
             .retain(|path, _| references.contains_key(path));
-        self.assets.poll()?;
-        if preload {
-            let missing: Vec<String> = references
+        let missing = preload.then(|| {
+            references
                 .keys()
                 .filter(|path| !self.fbx_meshes.contains_key(*path))
                 .cloned()
-                .collect();
+                .collect::<Vec<String>>()
+        });
+        self.assets.set_references(references)?;
+        self.assets.poll()?;
+        if let Some(missing) = missing {
             self.assets.preload(&missing)?;
             self.assets.poll()?;
         }
@@ -844,19 +851,33 @@ impl GpuRenderer {
             if model.kind != MeshKind::Fbx {
                 continue;
             }
-            let source = model
-                .source
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("entity {} has no FBX source", entity.id))?;
+            let Some(source) = model.source.as_deref() else {
+                let message = format!(
+                    "entity {} declares an FBX model without a source",
+                    entity.id
+                );
+                if preload {
+                    bail!("{message}");
+                }
+                self.report_asset_failure(&format!("entity:{}", entity.id), message);
+                continue;
+            };
             if !self.fbx_meshes.contains_key(source) {
                 if let Some(error) = self.assets.error(source) {
-                    bail!("could not load FBX asset '{source}': {error}");
+                    if preload {
+                        bail!("could not load FBX asset '{source}': {error}");
+                    }
+                    let message = format!("could not load FBX asset '{source}': {error}");
+                    self.report_asset_failure(source, message);
+                    continue;
                 }
-                if !preload {
-                    self.assets.load(source)?;
+                if !preload && let Err(error) = self.assets.load(source) {
+                    let message = format!("could not queue FBX asset '{source}': {error:#}");
+                    self.report_asset_failure(source, message);
                 }
                 if let Some(mesh) = self.assets.get(source) {
                     self.fbx_meshes.insert(source.to_string(), mesh);
+                    self.failed_assets.remove(source);
                 } else {
                     continue;
                 }
@@ -867,7 +888,7 @@ impl GpuRenderer {
                 .is_none_or(|object| object.source != source || object.color != model.color);
             if rebuild {
                 let mesh = &self.fbx_meshes[source];
-                let fallback = parse_color(&model.color);
+                let fallback = self.color_cache.get(&model.color);
                 let vertices: Vec<Vertex3d> = mesh
                     .vertices
                     .iter()
@@ -923,6 +944,15 @@ impl GpuRenderer {
         Ok(())
     }
 
+    /// Runtime asset failures degrade to "skip this entity this frame" with a
+    /// one-time stderr diagnostic; startup preload failures still bail so a
+    /// broken scene surfaces immediately.
+    fn report_asset_failure(&mut self, key: &str, message: String) {
+        if self.failed_assets.insert(key.to_string()) {
+            eprintln!("moni asset warning: {message}");
+        }
+    }
+
     pub fn render(&mut self, world: &World) -> anyhow::Result<RenderStatus> {
         let output = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(output)
@@ -947,7 +977,12 @@ impl GpuRenderer {
         }
         let preparation_started = Instant::now();
         self.prepare_fbx_objects(world, false)?;
-        build_vertices(world, &mut self.sprite_vertices, &mut self.sprite_order);
+        build_vertices(
+            world,
+            &mut self.sprite_vertices,
+            &mut self.sprite_order,
+            &mut self.color_cache,
+        );
         for quad in &self.overlay_quads {
             push_rectangle(
                 &mut self.sprite_vertices,
@@ -959,7 +994,7 @@ impl GpuRenderer {
                 quad.color,
             );
         }
-        build_vertices_3d(world, &mut self.mesh_vertices);
+        build_vertices_3d(world, &mut self.mesh_vertices, &mut self.color_cache);
         upload_vertices(
             &self.device,
             &self.queue,
@@ -1046,7 +1081,7 @@ impl GpuRenderer {
                 shadow_pass.draw(0..object.vertex_count, 0..1);
             }
         }
-        let background = parse_color(&world.viewport.background);
+        let background = self.color_cache.get(&world.viewport.background);
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("moni render pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1296,13 +1331,13 @@ fn create_depth_view(
     texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
-fn build_vertices_3d(world: &World, vertices: &mut Vec<Vertex3d>) {
+fn build_vertices_3d(world: &World, vertices: &mut Vec<Vertex3d>, colors: &mut ColorCache) {
     vertices.clear();
     for entity in world.entities.values() {
         let Some(model) = &entity.model else {
             continue;
         };
-        let color = parse_color(&model.color);
+        let color = colors.get(&model.color);
         match model.kind {
             MeshKind::Cube => push_cube(vertices, &model.transform, color),
             MeshKind::Plane => push_quad(
@@ -1665,7 +1700,12 @@ fn normalize(vector: [f32; 3]) -> [f32; 3] {
     [vector[0] / length, vector[1] / length, vector[2] / length]
 }
 
-fn build_vertices(world: &World, vertices: &mut Vec<Vertex>, sprite_order: &mut Vec<(i32, u64)>) {
+fn build_vertices(
+    world: &World,
+    vertices: &mut Vec<Vertex>,
+    sprite_order: &mut Vec<(i32, u64)>,
+    colors: &mut ColorCache,
+) {
     vertices.clear();
     sprite_order.clear();
     sprite_order.extend(world.entities.values().filter_map(|entity| {
@@ -1683,7 +1723,7 @@ fn build_vertices(world: &World, vertices: &mut Vec<Vertex>, sprite_order: &mut 
         let Some(sprite) = entity.sprite.as_ref() else {
             continue;
         };
-        let color = parse_color(&sprite.color);
+        let color = colors.get(&sprite.color);
         match sprite.kind {
             SpriteKind::Rectangle => push_rectangle(
                 vertices,
@@ -1800,6 +1840,28 @@ fn parse_color(value: &str) -> [f32; 4] {
     }
 }
 
+/// Memoizes `parse_color` so per-frame vertex building never re-parses hex
+/// strings. Scenes use a small palette, so the cache stays bounded; scripts may
+/// generate arbitrary colors, hence the clear-on-overflow bound.
+#[derive(Default)]
+struct ColorCache {
+    entries: HashMap<String, [f32; 4]>,
+}
+
+impl ColorCache {
+    fn get(&mut self, value: &str) -> [f32; 4] {
+        if let Some(color) = self.entries.get(value) {
+            return *color;
+        }
+        let color = parse_color(value);
+        if self.entries.len() >= MAX_CACHED_COLORS {
+            self.entries.clear();
+        }
+        self.entries.insert(value.to_owned(), color);
+        color
+    }
+}
+
 fn color_channel(value: &str, offset: usize) -> Option<u8> {
     value
         .get(offset..offset + 2)
@@ -1812,5 +1874,42 @@ fn srgb_to_linear(value: u8) -> f32 {
         value / 12.92
     } else {
         ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_color_matches_expected_channels() {
+        assert_eq!(parse_color("#ffffff"), [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(parse_color("#000000"), [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(parse_color("ffffff"), [1.0, 1.0, 1.0, 1.0]);
+        let red = parse_color("#ff0000");
+        assert_eq!(red[0], 1.0);
+        assert_eq!(red[1], 0.0);
+        assert_eq!(red[2], 0.0);
+        assert_eq!(red[3], 1.0);
+        assert_eq!(parse_color("#ffffffff"), [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(parse_color("#ffffff00")[3], 0.0);
+        assert_eq!(parse_color("not-a-color"), [1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn color_cache_matches_parse_color() {
+        let mut cache = ColorCache::default();
+        for value in ["#ffffff", "#10141f", "#4f8cffcc", "bogus"] {
+            assert_eq!(cache.get(value), parse_color(value));
+        }
+    }
+
+    #[test]
+    fn color_cache_stays_bounded() {
+        let mut cache = ColorCache::default();
+        for index in 0..MAX_CACHED_COLORS + 16 {
+            cache.get(&format!("#{index:06x}"));
+        }
+        assert!(cache.entries.len() <= MAX_CACHED_COLORS);
     }
 }

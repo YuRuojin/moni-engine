@@ -18,7 +18,7 @@ use crate::profile::Profile;
 use crate::scene3d::{Camera3d, CameraProjection, Vector3};
 
 pub fn run(args: Vec<String>) -> anyhow::Result<()> {
-    let mut scene_path = "testing/assets/perspective.mnsc".to_string();
+    let mut scene_path = "testing/assets/benchmark-3d.mnsc".to_string();
     let mut golden_path = None;
     let mut frame_limit = 0_u64;
     let mut index = 0;

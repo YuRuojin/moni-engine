@@ -43,4 +43,4 @@ Plugins are statically registered in Rust. Core component registration, scene mi
 
 ## Current limitations
 
-The plugin API, dynamic registration, and complete asset system do not exist yet. CPU/GPU baselines with about 1.98 million vertices, asynchronous loading, and cooked meshes exist, but memory curves, a scene matrix, textures, animation, asset packages, and link-time plugin pruning do not. SVG output in `render.rs` covers only 2D sprites.
+The plugin API, dynamic registration, and complete asset system do not exist yet. CPU/GPU baselines with about 1.98 million vertices, basic memory sampling via `testing/soak.cjs`, asynchronous loading, and cooked meshes exist, but a multi-scene memory matrix, textures, animation, asset packages, and link-time plugin pruning do not. SVG output in `render.rs` covers only 2D sprites.

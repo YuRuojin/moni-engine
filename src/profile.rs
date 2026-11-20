@@ -5,7 +5,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use winit::window::Window;
 
-use crate::host::{PluginError, PluginHandle, PluginHost};
+use crate::host::{Plugin, PluginError, PluginHandle, PluginHost};
 use crate::plugins::{RenderPlugin, SimulationPlugin};
 
 pub const PLUGIN_API_VERSION: u32 = 1;
@@ -267,36 +267,71 @@ impl Profile {
         collect_gpu_timestamps: bool,
     ) -> Result<Vec<PluginHandle>, PluginError> {
         let effective = self.resolve(&Target::current())?;
-        let mut handles = Vec::new();
+        // Capability providers such as core.fbx contribute permissions without a
+        // plugin instance. Grant them first so dependent plugins can start, and
+        // revoke them again if any later step fails.
+        let mut granted = Vec::new();
+        for plugin in &effective.plugins {
+            if plugin.manifest.id == "core.fbx" {
+                host.grant_permissions(&plugin.manifest.id, &plugin.manifest.permissions);
+                granted.push(plugin.manifest.id.clone());
+            }
+        }
+        // Construct every plugin instance before registering anything so a
+        // factory failure cannot leave partially registered state behind.
+        let mut pending: Vec<(Vec<String>, Box<dyn Plugin>)> = Vec::new();
+        let mut construction = Ok(());
         for plugin in &effective.plugins {
             match plugin.manifest.id.as_str() {
-                "core.simulation" => {
-                    handles.push(host.register_plugin_with_permissions(
-                        Box::new(SimulationPlugin),
-                        &plugin.manifest.permissions,
-                    )?);
-                }
+                "core.simulation" => pending.push((
+                    plugin.manifest.permissions.clone(),
+                    Box::new(SimulationPlugin) as Box<dyn Plugin>,
+                )),
                 "core.render" => {
-                    let window = window.clone().ok_or_else(|| {
-                        PluginError::new("core.render requires a window but headless was requested")
-                    })?;
-                    handles.push(host.register_plugin_with_permissions(
+                    let Some(window) = window.clone() else {
+                        construction = Err(PluginError::new(
+                            "core.render requires a window but headless was requested",
+                        ));
+                        break;
+                    };
+                    pending.push((
+                        plugin.manifest.permissions.clone(),
                         Box::new(RenderPlugin::new(
                             window,
                             collect_gpu_timestamps,
                             effective.contains("core.fbx"),
-                        )),
-                        &plugin.manifest.permissions,
-                    )?);
+                        )) as Box<dyn Plugin>,
+                    ));
                 }
-                "core.fbx" => {
-                    host.grant_permissions("core.fbx", &plugin.manifest.permissions);
-                }
-                "core.editor" => {}
+                "core.fbx" | "core.editor" => {}
                 id => {
-                    return Err(PluginError::new(format!(
+                    construction = Err(PluginError::new(format!(
                         "no static factory registered for plugin '{id}'"
                     )));
+                    break;
+                }
+            }
+        }
+        if let Err(error) = construction {
+            for id in &granted {
+                host.revoke_permissions(id);
+            }
+            return Err(error);
+        }
+        // Register in dependency order; on failure dispose the handles created
+        // so far in reverse order so the host is left exactly as it started.
+        let mut handles = Vec::new();
+        for (permissions, plugin) in pending {
+            match host.register_plugin_with_permissions(plugin, &permissions) {
+                Ok(handle) => handles.push(handle),
+                Err(error) => {
+                    while let Some(handle) = handles.pop() {
+                        let _ = handle.dispose(host);
+                    }
+                    for id in &granted {
+                        host.revoke_permissions(id);
+                    }
+                    return Err(error);
                 }
             }
         }
@@ -460,5 +495,54 @@ fn module(domain: ModuleDomain) -> ModuleDescriptor {
         platforms: vec![],
         architectures: vec![],
         configurations: vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::Engine;
+
+    #[test]
+    fn headless_default_instantiate_fails_and_leaves_host_clean() {
+        let mut host = PluginHost::new(Engine::new());
+        let profile = Profile::named("default").expect("default profile");
+        let error = profile
+            .instantiate(&mut host, None, false)
+            .expect_err("core.render requires a window");
+        assert!(error.to_string().contains("requires a window"));
+        assert!(!host.has_plugin("core.simulation"));
+        assert!(!host.has_plugin("core.render"));
+    }
+
+    #[test]
+    fn instantiate_registers_only_patched_plugins() {
+        let mut host = PluginHost::new(Engine::new());
+        let profile = Profile::named("default")
+            .expect("default profile")
+            .with_patch("core.render", false);
+        let handles = profile
+            .instantiate(&mut host, None, false)
+            .expect("simulation-only instantiate");
+        assert_eq!(handles.len(), 1);
+        assert!(host.has_plugin("core.simulation"));
+        assert!(!host.has_plugin("core.render"));
+        for handle in handles {
+            handle
+                .dispose(&mut host)
+                .expect("dispose simulation plugin");
+        }
+        assert!(!host.has_plugin("core.simulation"));
+    }
+
+    #[test]
+    fn minimal_profile_instantiates_nothing() {
+        let mut host = PluginHost::new(Engine::new());
+        let handles = Profile::named("minimal")
+            .expect("minimal profile")
+            .instantiate(&mut host, None, false)
+            .expect("minimal instantiate");
+        assert!(handles.is_empty());
+        assert!(!host.has_plugin("core.simulation"));
     }
 }
