@@ -12,6 +12,10 @@ Moni Engine is a lightweight 2D/3D engine kernel written in Rust. Its goal is a 
 - Directional/point lights, basic materials, and directional shadows.
 - An NDJSON command protocol, world snapshots, fixed simulation ticks, and persistent QuickJS scripting.
 - A single-thread static plugin host with dependency/access validation, rollback, and reverse cleanup.
+- Static manifests, domain/target filtering, dependency resolution, profiles/bundles/patches, and effective-tree export.
+- Independent `.mngp` game projects, lockfiles, a minimal template, and the `new/run/doctor` CLI.
+- Bounded asynchronous assets, reference/cancellation/timeout/cache management, `.mnec` cooked meshes, and concrete official plugin directories.
+- Host-enforced permissions, permission-diff acceptance, SHA-256 integrity, lockfile rollback, isolated imports, golden and compatibility/stability tests.
 - A read-only scene viewer, CPU benchmarks, and main/shadow-pass GPU timestamps.
 - TypeScript declarations and 2D/3D examples.
 

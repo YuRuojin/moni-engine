@@ -1,0 +1,11 @@
+{
+  "format": "moni-game-project",
+  "version": 1,
+  "name": "minimal-game",
+  "engine": "0.1.0",
+  "profile": "default",
+  "scene": "scenes/main.mnsc",
+  "plugins": [],
+  "patches": [],
+  "dependencies": {}
+}

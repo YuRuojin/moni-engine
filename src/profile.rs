@@ -128,7 +128,7 @@ impl PluginManifest {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct ProfilePatch {
     pub plugin: String,
     pub enabled: bool,
@@ -140,6 +140,7 @@ pub struct Profile {
     pub bundles: Vec<String>,
     pub plugins: Vec<String>,
     pub patches: Vec<ProfilePatch>,
+    pub revoked_permissions: Vec<(String, String)>,
 }
 
 impl Profile {
@@ -156,6 +157,7 @@ impl Profile {
             bundles: bundles.into_iter().map(str::to_string).collect(),
             plugins: Vec::new(),
             patches: Vec::new(),
+            revoked_permissions: Vec::new(),
         })
     }
 
@@ -164,6 +166,12 @@ impl Profile {
             plugin: plugin.to_string(),
             enabled,
         });
+        self
+    }
+
+    pub fn with_revoked_permission(mut self, plugin: &str, permission: &str) -> Self {
+        self.revoked_permissions
+            .push((plugin.to_string(), permission.to_string()));
         self
     }
 
@@ -203,9 +211,20 @@ impl Profile {
         }
         let mut plugins = Vec::new();
         for id in state.ordered {
-            let manifest = registry
+            let mut manifest = registry
                 .get(&id)
-                .expect("dependency resolver only returns registered plugins");
+                .expect("dependency resolver only returns registered plugins")
+                .clone();
+            for (plugin_id, permission) in &self.revoked_permissions {
+                if plugin_id == &manifest.id {
+                    if !manifest.permissions.contains(permission) {
+                        return Err(PluginError::new(format!(
+                            "cannot revoke undeclared permission '{permission}' from '{plugin_id}'"
+                        )));
+                    }
+                    manifest.permissions.retain(|value| value != permission);
+                }
+            }
             let modules: Vec<ModuleDescriptor> = manifest
                 .modules
                 .iter()
@@ -252,19 +271,28 @@ impl Profile {
         for plugin in &effective.plugins {
             match plugin.manifest.id.as_str() {
                 "core.simulation" => {
-                    handles.push(host.register_plugin(Box::new(SimulationPlugin))?);
+                    handles.push(host.register_plugin_with_permissions(
+                        Box::new(SimulationPlugin),
+                        &plugin.manifest.permissions,
+                    )?);
                 }
                 "core.render" => {
                     let window = window.clone().ok_or_else(|| {
                         PluginError::new("core.render requires a window but headless was requested")
                     })?;
-                    handles.push(host.register_plugin(Box::new(RenderPlugin::new(
-                        window,
-                        collect_gpu_timestamps,
-                        effective.contains("core.fbx"),
-                    )))?);
+                    handles.push(host.register_plugin_with_permissions(
+                        Box::new(RenderPlugin::new(
+                            window,
+                            collect_gpu_timestamps,
+                            effective.contains("core.fbx"),
+                        )),
+                        &plugin.manifest.permissions,
+                    )?);
                 }
-                "core.fbx" | "core.editor" => {}
+                "core.fbx" => {
+                    host.grant_permissions("core.fbx", &plugin.manifest.permissions);
+                }
+                "core.editor" => {}
                 id => {
                     return Err(PluginError::new(format!(
                         "no static factory registered for plugin '{id}'"
@@ -290,6 +318,10 @@ pub struct EffectiveProfile {
 }
 
 impl EffectiveProfile {
+    pub fn manifests(&self) -> impl Iterator<Item = &PluginManifest> {
+        self.plugins.iter().map(|plugin| &plugin.manifest)
+    }
+
     pub fn contains(&self, id: &str) -> bool {
         self.plugins.iter().any(|plugin| plugin.manifest.id == id)
     }

@@ -28,4 +28,4 @@ Keep the current persistent per-entity QuickJS host and extract a language-indep
 
 ## Current limitations
 
-QuickJS and NDJSON currently live in `src/script.rs` and `src/protocol.rs`; they are not plugins. Each scripted entity has a persistent context, evaluates top-level code once, retains JS state across pause/resume, and recreates the context when source is replaced. World snapshots do not persist the JS heap. Breakpoint debugging, hot-reload state migration, and a separate permission system remain unimplemented.
+The QuickJS provider now lives in [`quickjs/`](quickjs/README_en.md), while NDJSON remains in `src/protocol.rs`. Registration is static and has no independent ABI. Each scripted entity has a persistent context, evaluates top-level code once, retains JS state across pause/resume, and recreates the context when source is replaced. World snapshots do not persist the JS heap. Breakpoint debugging, hot-reload state migration, and a separate permission system remain unimplemented.

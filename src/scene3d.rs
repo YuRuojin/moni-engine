@@ -133,11 +133,12 @@ impl Model3d {
             (MeshKind::Fbx, Some(source))
                 if !source.is_empty()
                     && source.len() <= 256
-                    && source.to_ascii_lowercase().ends_with(".fbx") => {}
+                    && (source.to_ascii_lowercase().ends_with(".fbx")
+                        || source.to_ascii_lowercase().ends_with(".mnec")) => {}
             (MeshKind::Fbx, _) => {
                 return Err(EngineError::new(
                     "invalid_model_3d",
-                    "FBX models require a workspace-relative .fbx source path",
+                    "FBX models require a workspace-relative .fbx or .mnec source path",
                 ));
             }
             (_, Some(_)) => {

@@ -361,7 +361,14 @@ pub fn capabilities() -> Value {
             "coordinateSystem": "2D pixels with y down; right-handed 3D with y up; rotations in radians",
             "camera3d": "Perspective or orthographic camera with position, target, fov_y, orthographic_height, near and far",
             "meshes3d": ["cube", "plane", "fbx"],
-            "fbxModel": "Workspace-relative source path; geometry and base colors loaded once per renderer",
+            "fbxModel": "Workspace-relative .fbx or .mnec source; geometry and base colors use shared GPU caches",
+            "assets": {
+                "formats": ["fbx", "mnec"],
+                "worker": "moni-asset-loader",
+                "queueCapacity": 64,
+                "timeoutSeconds": 10,
+                "runtimeReads": "nonblocking poll after initialization preload"
+            },
             "scene": {
                 "format": "moni-scene",
                 "version": 2,
@@ -398,6 +405,13 @@ pub fn capabilities() -> Value {
             "quit": { "args": {} }
         },
         "components": crate::components::ComponentRegistry::new().agent_schemas(),
+        "profiles": {
+            "pluginApiVersion": 1,
+            "bundles": ["minimal", "default", "headless", "editor"],
+            "moduleDomains": ["runtime", "editor", "build", "developer", "test"],
+            "patches": "ordered enable/disable by plugin ID",
+            "pruning": "effective-tree and runtime instantiation only"
+        },
         "host": {
             "scheduler": "single-thread dependency-ordered static plugins",
             "maxSystemTasks": 1024,
@@ -406,6 +420,13 @@ pub fn capabilities() -> Value {
                 "core.simulation": "logic",
                 "core.render": "render"
             }
+        },
+        "security": {
+            "permissions": "manifest-granted and host-enforced",
+            "updates": "permission diff with explicit acceptance",
+            "integrity": "SHA-256 per plugin manifest",
+            "importIsolation": "time-limited child process; crash containment only",
+            "lockRollback": "moni.lock.backup"
         },
         "script": {
             "language": "TypeScript compiled to JavaScript",

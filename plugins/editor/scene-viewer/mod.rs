@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -18,6 +19,7 @@ use crate::scene3d::{Camera3d, CameraProjection, Vector3};
 
 pub fn run(args: Vec<String>) -> anyhow::Result<()> {
     let mut scene_path = "testing/assets/perspective.mnsc".to_string();
+    let mut golden_path = None;
     let mut frame_limit = 0_u64;
     let mut index = 0;
     while index < args.len() {
@@ -28,6 +30,13 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
                     .get(index)
                     .ok_or_else(|| anyhow::anyhow!("--scene requires a path"))?
                     .clone();
+            }
+            "--golden" => {
+                index += 1;
+                golden_path = Some(crate::workspace_path(
+                    args.get(index)
+                        .ok_or_else(|| anyhow::anyhow!("--golden requires a path"))?,
+                )?);
             }
             "--frames" => {
                 index += 1;
@@ -54,7 +63,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
     host.world_mut().viewport.height = 540;
     let event_loop = EventLoop::new().context("could not create the editor event loop")?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = EditorApp::new(host, scene_path, frame_limit);
+    let mut app = EditorApp::new(host, scene_path, frame_limit, golden_path);
     event_loop
         .run_app(&mut app)
         .context("the editor event loop failed")?;
@@ -73,6 +82,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
             "frames": app.frames,
             "entities": app.host.world().entities.len(),
             "loadedMeshVertices": loaded_mesh_vertices,
+            "goldenCaptured": app.golden_mode,
         })
     );
     Ok(())
@@ -87,11 +97,18 @@ struct EditorApp {
     frames: u64,
     frame_ms: f64,
     gpu_samples: Vec<(f32, f32)>,
+    golden_mode: bool,
+    golden_path: Option<PathBuf>,
     failure: Option<anyhow::Error>,
 }
 
 impl EditorApp {
-    fn new(host: PluginHost, scene_path: String, frame_limit: u64) -> Self {
+    fn new(
+        host: PluginHost,
+        scene_path: String,
+        frame_limit: u64,
+        golden_path: Option<PathBuf>,
+    ) -> Self {
         Self {
             initial_camera: host.world().camera.clone(),
             host,
@@ -101,6 +118,8 @@ impl EditorApp {
             frames: 0,
             frame_ms: 0.0,
             gpu_samples: Vec::new(),
+            golden_mode: golden_path.is_some(),
+            golden_path,
             failure: None,
         }
     }
@@ -205,17 +224,26 @@ impl ApplicationHandler for EditorApp {
                         )
                     })
                     .unwrap_or((0.0, 0));
-                let overlay = build_overlay(
-                    self.host.world(),
-                    &self.scene_path,
-                    preparation_ms,
-                    self.frame_ms,
-                    &self.gpu_samples,
-                    loaded_vertices,
-                );
+                let overlay = if self.golden_mode {
+                    Vec::new()
+                } else {
+                    build_overlay(
+                        self.host.world(),
+                        &self.scene_path,
+                        preparation_ms,
+                        self.frame_ms,
+                        &self.gpu_samples,
+                        loaded_vertices,
+                    )
+                };
                 if let Some(render_plugin) = self.host.plugin_mut::<RenderPlugin>(RenderPlugin::ID)
                 {
                     render_plugin.set_overlay_quads(overlay);
+                }
+                if let Some(path) = self.golden_path.take()
+                    && let Some(plugin) = self.host.plugin_mut::<RenderPlugin>(RenderPlugin::ID)
+                {
+                    plugin.capture_next(path);
                 }
                 let started = Instant::now();
                 match self.host.run_stage(SystemStage::Render) {

@@ -11,7 +11,7 @@
 - **Patch**: replaces settings or inserts plugins by declaration identity without modifying bundle source.
 - **Launch adapter**: resolves a named profile and starts the host rather than implementing a separate hardcoded feature composition.
 
-Official composition directions include `base`, `default`, `editor`, `player`, `headless`, and `server`. Headless and server profiles omit window and rendering providers instead of maintaining another engine.
+Current static compositions are `minimal`, `default`, `editor`, and `headless`; `base`, `player`, and `server` remain future directions. Headless initializes no window, GPU, QuickJS, or FBX provider instead of maintaining another engine. See [`sdk/profiles_en.md`](../sdk/profiles_en.md) for the contract.
 
 ## Ordered overrides
 
@@ -25,11 +25,11 @@ Profiles compose capabilities without calling concrete providers directly. Every
 
 ## Performance and stability
 
-- Release builds prune plugins and dependencies absent from the final effective tree rather than merely skipping their updates after startup.
+- Unselected plugins are excluded from the effective tree and instantiation. Cargo features, link-time binary pruning, and package pruning remain unimplemented.
 - `player` excludes the editor, Hub, and source-asset importers; `headless` does not initialize windows or GPUs.
 - Configuration overrides cannot bypass permission, dependency, or compatibility validation.
 - Measure startup, memory, binary size, and shutdown cleanup for every profile, and identify the declaration layer responsible for a patch failure.
 
 ## Current limitations
 
-Only the `client`, `serve`, and `demo` entries in `src/main.rs` exist. Profile resolution, bundle formats, ordered patches, effective-tree export, and composition-based build pruning are not implemented.
+Static manifests, target filtering, dependency resolution, minimal/default/headless/editor bundles, ordered enable/disable patches, effective-tree export, and runtime instantiation pruning exist. External manifest loading, dynamic registries, project profile files, link-time pruning, and server compositions remain unimplemented.

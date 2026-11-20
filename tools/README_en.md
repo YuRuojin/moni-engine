@@ -28,4 +28,4 @@ Direct project dependencies and transitive plugin dependencies form a determinis
 
 ## Current limitations
 
-There is no Hub, engine installer, registry client, dependency resolver, lockfile implementation, project creator, or upgrade tool. Current commands run engine examples from source only.
+`new`, `run`, `doctor`, and project-aware `profile dump` now support template copying, Git initialization, lockfile generation/validation/update/backup/rollback, permission-diff acceptance, and project TypeScript builds. A Hub, engine installer, plugin registry client, external dependency installation, and general project upgrades remain unimplemented.

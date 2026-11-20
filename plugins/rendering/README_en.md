@@ -26,6 +26,10 @@ First extract the built-in 2D/3D paths as default static plugins, then establish
 - Avoid synchronous GPU readbacks. Resizing, device loss, and plugin deactivation must release or rebuild the correct resources.
 - Disabling optional shadows or post-processing must also disable their render passes, textures, and per-frame work.
 
+## Implementation
+
+- [`wgpu/`](wgpu/README_en.md): current 2D/3D/shadow rendering provider and WGSL shaders.
+
 ## Current limitations
 
 Supported features include external FBX meshes, base color/metallic/roughness materials, directional light, up to 8 point lights, a 1024 shadow map with 3x3 PCF, GPU vertex caches, model matrices, and bounding-sphere frustum culling. Full textured materials, cascaded shadows, post-processing, and instancing are absent. CPU and main/shadow-pass GPU baselines exist, but no scene matrix or graphics-memory baseline exists.

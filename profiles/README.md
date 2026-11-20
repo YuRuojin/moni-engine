@@ -11,7 +11,7 @@
 - **Patch**：按声明标识替换配置或插入插件，不修改 bundle 源码。
 - **启动适配器**：只解析命名 profile 并启动宿主，不实现另一条硬编码功能组合。
 
-官方组合方向包括 `base`、`default`、`editor`、`player`、`headless` 和 `server`。`headless` 与 `server` 通过不挂载窗口和渲染提供方实现，而不是维护另一套引擎。
+当前静态组合包括 `minimal`、`default`、`editor` 和 `headless`。`base`、`player` 和 `server` 是后续组合方向。`headless` 不挂载窗口、GPU、QuickJS 或 FBX 提供方，而不是维护另一套引擎。详细契约见 [`sdk/profiles.md`](../sdk/profiles.md)。
 
 ## 有序覆盖
 
@@ -25,11 +25,11 @@ profile 只组合能力，不直接调用具体提供方。每项可替换能力
 
 ## 性能与稳定性
 
-- 发布构建根据最终有效树裁剪未选择插件及依赖，而非启动后仅跳过更新。
+- 当前在有效树和实例化层排除未选择插件；Cargo feature、链接级二进制和发布包裁剪尚未实现。
 - `player` 不包含编辑器、Hub 和源资源导入器；`headless` 不初始化窗口或 GPU。
 - 配置覆盖不得绕过权限、依赖和兼容性校验。
 - 每种 profile 分别测量启动、内存、二进制体积和关闭清理；补丁造成失败时报告具体声明层。
 
 ## 当前限制
 
-当前只有 `src/main.rs` 中的 `client`、`serve` 和 `demo` 入口，没有 profile 解析器、bundle 格式、有序补丁、有效树导出或按组合裁剪构建。
+已实现静态清单、目标过滤、依赖解析、最小/默认/无头/编辑器 bundles、有序启停 patch、有效树导出和运行时实例化裁剪。尚未实现外部清单加载、动态插件仓库、项目 profile 文件、链接级裁剪或服务器组合。

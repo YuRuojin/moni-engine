@@ -2,7 +2,7 @@
 
 [中文](README.md) | English
 
-`plugins/` is the taxonomy for officially maintained capabilities. These directories define ownership and dependency direction; **plugin manifests, a dynamic loader, a stable ABI, and automatic discovery are not implemented yet**. The first implementation stage uses static Rust composition. Create a concrete plugin directory only for a real implementation, not an empty placeholder.
+`plugins/` is the taxonomy for officially maintained capabilities. Static manifests, execution domains, and dependency resolution are implemented in `src/profile.rs`; **a dynamic loader, stable ABI, external manifest loading, and automatic discovery are not implemented**. Create a concrete plugin directory only for a real implementation, not an empty placeholder.
 
 ## Categories
 

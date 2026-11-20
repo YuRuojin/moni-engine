@@ -8,7 +8,9 @@
     "demo": "npm run build && cargo run -- client",
     "demo:3d": "npm run build && cargo run -- client --scene 3d",
     "editor": "npm run build && cargo run -- editor",
-    "benchmark": "npm run build && node testing/run-benchmarks.cjs"
+    "benchmark": "npm run build && node testing/run-benchmarks.cjs",
+    "test:compat": "npm run build && cargo build && node testing/plugin-compat.cjs",
+    "test:soak": "npm run build && cargo build && node testing/soak.cjs"
   },
   "devDependencies": {
     "typescript": "5.9.3"

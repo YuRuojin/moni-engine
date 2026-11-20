@@ -28,4 +28,4 @@
 
 ## 当前限制
 
-目前没有可生成模板、项目清单规范、锁文件或 `moni new` 命令。这里只固定模板职责，尚未提供游戏工程脚手架。
+`minimal-game/` 已是可复制模板，包含 `.mngp`、`.mnsc`、TypeScript 源码、npm 构建、Git 忽略规则和双语说明。`moni new` 会复制模板、生成 `moni.lock` 并初始化独立 Git 仓库；格式契约见 [`sdk/project-format.md`](../sdk/project-format.md)。正式发布时仍需将模板随引擎安装包分发。

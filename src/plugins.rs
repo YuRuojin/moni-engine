@@ -1,13 +1,13 @@
 use std::any::Any;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use winit::window::Window;
 
-use crate::engine::Engine;
 use crate::gpu::{GpuRenderer, OverlayQuad};
 use crate::host::{
-    Access, Plugin, PluginError, PluginOutput, Resource, SystemDescriptor, SystemStage,
-    ThreadAffinity,
+    Access, Plugin, PluginContext, PluginError, PluginOutput, Resource, SystemDescriptor,
+    SystemStage, ThreadAffinity,
 };
 
 pub struct SimulationPlugin;
@@ -45,28 +45,30 @@ impl Plugin for SimulationPlugin {
         ]
     }
 
-    fn start(&mut self, _engine: &mut Engine) -> Result<(), PluginError> {
-        Ok(())
+    fn start(&mut self, context: &mut PluginContext) -> Result<(), PluginError> {
+        context.require("script.execute")
     }
 
-    fn stop(&mut self, engine: &mut Engine) {
-        engine.shutdown_runtime();
+    fn stop(&mut self, context: &mut PluginContext) {
+        context.engine.shutdown_runtime();
     }
 
     fn execute(
         &mut self,
         stage: SystemStage,
-        engine: &mut Engine,
+        context: &mut PluginContext,
     ) -> Result<PluginOutput, PluginError> {
         match stage {
             SystemStage::FixedUpdate => {
-                engine
+                context.require("script.execute")?;
+                context
+                    .engine
                     .step(1)
                     .map_err(|error| PluginError::new(error.message))?;
                 Ok(PluginOutput::None)
             }
             SystemStage::Shutdown => {
-                engine.shutdown_runtime();
+                context.engine.shutdown_runtime();
                 Ok(PluginOutput::None)
             }
             _ => Ok(PluginOutput::None),
@@ -129,6 +131,12 @@ impl RenderPlugin {
             renderer.set_overlay_quads(quads);
         }
     }
+
+    pub fn capture_next(&mut self, path: PathBuf) {
+        if let Some(renderer) = &mut self.renderer {
+            renderer.capture_next(path);
+        }
+    }
 }
 
 impl Plugin for RenderPlugin {
@@ -173,11 +181,15 @@ impl Plugin for RenderPlugin {
         ]
     }
 
-    fn start(&mut self, engine: &mut Engine) -> Result<(), PluginError> {
+    fn start(&mut self, context: &mut PluginContext) -> Result<(), PluginError> {
+        context.require("gpu.create")?;
+        if self.load_fbx_assets {
+            context.require_from("core.fbx", "asset.read.workspace")?;
+        }
         self.renderer = Some(
             GpuRenderer::new(
                 Arc::clone(&self.window),
-                engine.world(),
+                context.engine.world(),
                 self.collect_gpu_timestamps,
                 self.load_fbx_assets,
             )
@@ -186,22 +198,26 @@ impl Plugin for RenderPlugin {
         Ok(())
     }
 
-    fn stop(&mut self, _engine: &mut Engine) {
+    fn stop(&mut self, _context: &mut PluginContext) {
         self.renderer = None;
     }
 
     fn execute(
         &mut self,
         stage: SystemStage,
-        engine: &mut Engine,
+        context: &mut PluginContext,
     ) -> Result<PluginOutput, PluginError> {
         match stage {
             SystemStage::Render => {
+                context.require("gpu.create")?;
+                if self.load_fbx_assets {
+                    context.require_from("core.fbx", "asset.read.workspace")?;
+                }
                 let status = self
                     .renderer
                     .as_mut()
                     .ok_or_else(|| PluginError::new("render plugin is not started"))?
-                    .render(engine.world())
+                    .render(context.engine.world())
                     .map_err(|error| PluginError::new(format!("{error:#}")))?;
                 Ok(PluginOutput::Render(status))
             }

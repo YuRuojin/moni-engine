@@ -31,6 +31,18 @@ The first stage provides version-aligned static Rust interfaces only, with no st
 - Registrations are reversible; incompatible versions or permissions fail before modifying the world.
 - Schema migrations require repeatable verification, and unknown plugin data must not be silently discarded.
 
+## Permissions and isolation
+
+[Plugin permissions, integrity, and isolation](security_en.md) defines host permission enforcement, update acceptance, SHA-256, lockfile rollback, and import process isolation.
+
+## Game projects and lockfiles
+
+[Moni game project and lockfile](project-format_en.md) defines `.mngp`, `moni.lock`, and the basic CLI for independent projects.
+
+## Plugin manifests and composition
+
+[Plugin manifests and profile composition](profiles_en.md) defines static manifests, execution domains, target filtering, dependency resolution, static bundles, ordered patches, and effective-tree export.
+
 ## Static plugin lifecycle
 
 [Static plugin host and lifecycle](plugin-lifecycle_en.md) defines stages, dependencies, access constraints, thread affinity, registration rollback, disposal, and reverse cleanup.
@@ -41,4 +53,4 @@ The first stage provides version-aligned static Rust interfaces only, with no st
 
 ## Current limitations
 
-`.mnsc` v2, v1 migration, and the core component registry exist, but there is no plugin manifest format, public SDK crate, stable ABI, code generation, permission enforcer, or dynamic third-party component registration.
+`.mnsc` v2, v1 migration, the core component registry, and static plugin manifests exist, but external manifest loading, a public SDK crate, stable ABI, code generation, permission enforcement, and dynamic third-party component registration do not.

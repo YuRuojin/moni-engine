@@ -28,4 +28,4 @@ A generated game repository has independent commits, branches, and releases. Eng
 
 ## Current limitations
 
-No generatable template, project manifest specification, lockfile, or `moni new` command exists. This directory fixes template ownership only; it does not provide game scaffolding yet.
+`minimal-game/` is a copyable template containing `.mngp`, `.mnsc`, TypeScript source, npm build configuration, Git ignores, and bilingual documentation. `moni new` copies it, generates `moni.lock`, and initializes an independent Git repository. See [`sdk/project-format_en.md`](../sdk/project-format_en.md). Release distribution still needs to ship templates with the engine.

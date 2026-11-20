@@ -27,4 +27,4 @@ Start with the independent project model and read-only scene preview, then add h
 
 ## Current limitations
 
-The `editor` command provides a read-only scene viewer that loads `.mnsc`, displays entity hierarchy, model resources, lights, and performance overlays, and supports camera movement and zoom. It neither executes scripts nor writes files. Full property editing, project creation, control registration, and undo remain unimplemented.
+The [`scene-viewer/`](scene-viewer/README_en.md) read-only viewer loads `.mnsc`, displays entity hierarchy, model resources, lights, and performance overlays, and supports camera movement and zoom. It neither executes scripts nor writes files. Full property editing, project creation, control registration, and undo remain unimplemented.

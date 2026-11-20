@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
@@ -94,15 +94,61 @@ pub enum PluginOutput {
     Render(crate::gpu::RenderStatus),
 }
 
+#[derive(Default)]
+pub struct PermissionPolicy {
+    granted: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl PermissionPolicy {
+    fn grant(&mut self, plugin_id: &str, permissions: &[String]) {
+        self.granted
+            .insert(plugin_id.to_string(), permissions.iter().cloned().collect());
+    }
+
+    fn revoke(&mut self, plugin_id: &str) {
+        self.granted.remove(plugin_id);
+    }
+
+    pub fn require(&self, plugin_id: &str, permission: &str) -> Result<(), PluginError> {
+        if self
+            .granted
+            .get(plugin_id)
+            .is_some_and(|permissions| permissions.contains(permission))
+        {
+            Ok(())
+        } else {
+            Err(PluginError::new(format!(
+                "plugin '{plugin_id}' lacks required permission '{permission}'"
+            )))
+        }
+    }
+}
+
+pub struct PluginContext<'a> {
+    pub engine: &'a mut Engine,
+    pub permissions: &'a PermissionPolicy,
+    pub plugin_id: &'static str,
+}
+
+impl PluginContext<'_> {
+    pub fn require(&self, permission: &str) -> Result<(), PluginError> {
+        self.permissions.require(self.plugin_id, permission)
+    }
+
+    pub fn require_from(&self, plugin_id: &str, permission: &str) -> Result<(), PluginError> {
+        self.permissions.require(plugin_id, permission)
+    }
+}
+
 pub trait Plugin: Any {
     fn id(&self) -> &'static str;
     fn systems(&self) -> Vec<SystemDescriptor>;
-    fn start(&mut self, engine: &mut Engine) -> Result<(), PluginError>;
-    fn stop(&mut self, engine: &mut Engine);
+    fn start(&mut self, context: &mut PluginContext) -> Result<(), PluginError>;
+    fn stop(&mut self, context: &mut PluginContext);
     fn execute(
         &mut self,
         stage: SystemStage,
-        engine: &mut Engine,
+        context: &mut PluginContext,
     ) -> Result<PluginOutput, PluginError>;
     fn resize(&mut self, _width: u32, _height: u32) {}
     fn as_any_mut(&mut self) -> &mut dyn Any;
@@ -128,6 +174,7 @@ pub struct PluginHost {
     order: Vec<&'static str>,
     systems: Vec<SystemDescriptor>,
     queue: VecDeque<SystemDescriptor>,
+    permissions: PermissionPolicy,
     last_render_status: Option<crate::gpu::RenderStatus>,
     shutdown: bool,
 }
@@ -140,6 +187,7 @@ impl PluginHost {
             order: Vec::new(),
             systems: Vec::new(),
             queue: VecDeque::with_capacity(MAX_SYSTEM_TASKS),
+            permissions: PermissionPolicy::default(),
             last_render_status: None,
             shutdown: false,
         }
@@ -157,9 +205,14 @@ impl PluginHost {
         self.engine.take_events()
     }
 
-    pub fn register_plugin(
+    pub fn grant_permissions(&mut self, plugin_id: &str, permissions: &[String]) {
+        self.permissions.grant(plugin_id, permissions);
+    }
+
+    pub fn register_plugin_with_permissions(
         &mut self,
         mut plugin: Box<dyn Plugin>,
+        granted_permissions: &[String],
     ) -> Result<PluginHandle, PluginError> {
         if self.shutdown {
             return Err(PluginError::new("cannot register a plugin after shutdown"));
@@ -179,9 +232,16 @@ impl PluginHost {
             self.systems.retain(|system| system.plugin_id != id);
             return Err(error);
         }
-        if let Err(error) = plugin.start(&mut self.engine) {
+        self.permissions.grant(id, granted_permissions);
+        let mut context = PluginContext {
+            engine: &mut self.engine,
+            permissions: &self.permissions,
+            plugin_id: id,
+        };
+        if let Err(error) = plugin.start(&mut context) {
             self.systems.retain(|system| system.plugin_id != id);
-            plugin.stop(&mut self.engine);
+            plugin.stop(&mut context);
+            self.permissions.revoke(id);
             return Err(error);
         }
         self.plugins.insert(id, plugin);
@@ -197,7 +257,12 @@ impl PluginHost {
         self.systems.retain(|system| system.plugin_id != id);
         self.queue.retain(|system| system.plugin_id != id);
         let mut plugin = plugin;
-        plugin.stop(&mut self.engine);
+        plugin.stop(&mut PluginContext {
+            engine: &mut self.engine,
+            permissions: &self.permissions,
+            plugin_id: id,
+        });
+        self.permissions.revoke(id);
         Ok(())
     }
 
@@ -223,7 +288,14 @@ impl PluginHost {
                 .plugins
                 .get_mut(plugin_id)
                 .expect("registered system owner exists")
-                .execute(stage, &mut self.engine);
+                .execute(
+                    stage,
+                    &mut PluginContext {
+                        engine: &mut self.engine,
+                        permissions: &self.permissions,
+                        plugin_id,
+                    },
+                );
             match result {
                 Ok(PluginOutput::Render(status)) => self.last_render_status = Some(status),
                 Ok(PluginOutput::None) => {}
@@ -265,13 +337,18 @@ impl PluginHost {
         let result = self.run_stage(SystemStage::Shutdown);
         for id in self.order.iter().rev() {
             if let Some(plugin) = self.plugins.get_mut(id) {
-                plugin.stop(&mut self.engine);
+                plugin.stop(&mut PluginContext {
+                    engine: &mut self.engine,
+                    permissions: &self.permissions,
+                    plugin_id: id,
+                });
             }
         }
         self.plugins.clear();
         self.order.clear();
         self.systems.clear();
         self.queue.clear();
+        self.permissions = PermissionPolicy::default();
         self.shutdown = true;
         result
     }

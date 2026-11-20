@@ -1,14 +1,16 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
+use crate::assets::AssetRuntime;
 use crate::engine::{SpriteKind, World};
-use crate::fbx::{FbxMesh, load_fbx};
+use crate::fbx::FbxMesh;
 use crate::scene3d::{Camera3d, CameraProjection, Light, MeshKind, Transform3d, Vector3};
 
 const CIRCLE_SEGMENTS: usize = 48;
@@ -187,10 +189,12 @@ pub struct GpuRenderer {
     mesh_vertex_buffer: wgpu::Buffer,
     sprite_vertex_capacity: usize,
     mesh_vertex_capacity: usize,
-    fbx_meshes: BTreeMap<String, FbxMesh>,
+    fbx_meshes: BTreeMap<String, Arc<FbxMesh>>,
+    assets: AssetRuntime,
     load_fbx_assets: bool,
     gpu_timing: Option<GpuTiming>,
     gpu_samples: Vec<(f32, f32)>,
+    capture_path: Option<PathBuf>,
     last_preparation_time: Duration,
 }
 
@@ -258,7 +262,7 @@ impl GpuRenderer {
             .find(|mode| *mode == wgpu::PresentMode::Fifo)
             .unwrap_or(capabilities.present_modes[0]);
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             format,
             color_space: wgpu::SurfaceColorSpace::Auto,
             width: size.width.max(1),
@@ -626,12 +630,14 @@ impl GpuRenderer {
             sprite_vertex_capacity: INITIAL_SPRITE_VERTEX_CAPACITY,
             mesh_vertex_capacity: INITIAL_MESH_VERTEX_CAPACITY,
             fbx_meshes: BTreeMap::new(),
+            assets: AssetRuntime::new(),
             load_fbx_assets,
             gpu_timing,
             gpu_samples: Vec::new(),
+            capture_path: None,
             last_preparation_time: Duration::ZERO,
         };
-        renderer.prepare_fbx_objects(world)?;
+        renderer.prepare_fbx_objects(world, true)?;
         Ok(renderer)
     }
 
@@ -666,6 +672,87 @@ impl GpuRenderer {
 
     pub fn take_gpu_samples(&mut self) -> Vec<(f32, f32)> {
         std::mem::take(&mut self.gpu_samples)
+    }
+
+    pub fn capture_next(&mut self, path: PathBuf) {
+        self.capture_path = Some(path);
+    }
+
+    fn prepare_capture(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        texture: &wgpu::Texture,
+    ) -> (wgpu::Buffer, u32) {
+        let row_bytes = self.config.width * 4;
+        let padded_bytes_per_row = row_bytes.div_ceil(256) * 256;
+        let size = u64::from(padded_bytes_per_row * self.config.height);
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("golden capture readback"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(self.config.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: self.config.width,
+                height: self.config.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        (buffer, padded_bytes_per_row)
+    }
+
+    fn save_capture(
+        &self,
+        buffer: &wgpu::Buffer,
+        padded_bytes_per_row: u32,
+        path: &PathBuf,
+    ) -> anyhow::Result<()> {
+        let size = u64::from(padded_bytes_per_row * self.config.height);
+        let map_error = Arc::new(std::sync::Mutex::new(Option::<String>::None));
+        let callback_error = Arc::clone(&map_error);
+        buffer.map_async(wgpu::MapMode::Read, 0..size, move |result| {
+            if let Err(error) = result {
+                *callback_error.lock().expect("map error mutex") = Some(error.to_string());
+            }
+        });
+        self.device.poll(wgpu::PollType::wait_indefinitely())?;
+        if let Some(error) = map_error.lock().expect("map error mutex").take() {
+            return Err(anyhow::anyhow!(error));
+        }
+        let bytes = buffer.get_mapped_range(..)?;
+        let row_bytes = (self.config.width * 4) as usize;
+        let mut pixels = Vec::with_capacity(row_bytes * self.config.height as usize);
+        for row in bytes.chunks(padded_bytes_per_row as usize) {
+            pixels.extend_from_slice(&row[..row_bytes]);
+        }
+        drop(bytes);
+        buffer.unmap();
+        std::fs::write(path, pixels)?;
+        std::fs::write(
+            path.with_extension("json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "width": self.config.width,
+                "height": self.config.height,
+                "format": format!("{:?}", self.config.format),
+                "bytesPerRow": row_bytes,
+            }))?,
+        )?;
+        Ok(())
     }
 
     fn read_gpu_samples(&mut self) -> anyhow::Result<()> {
@@ -710,10 +797,11 @@ impl GpuRenderer {
         Ok(())
     }
 
-    fn prepare_fbx_objects(&mut self, world: &World) -> anyhow::Result<()> {
+    fn prepare_fbx_objects(&mut self, world: &World, preload: bool) -> anyhow::Result<()> {
         if !self.load_fbx_assets {
             self.fbx_objects.clear();
             self.fbx_meshes.clear();
+            self.assets.shutdown();
             return Ok(());
         }
         self.fbx_objects.retain(|id, _| {
@@ -724,6 +812,31 @@ impl GpuRenderer {
                     .is_some_and(|model| model.kind == MeshKind::Fbx)
             })
         });
+        let mut references = BTreeMap::new();
+        for model in world
+            .entities
+            .values()
+            .filter_map(|entity| entity.model.as_ref())
+        {
+            if model.kind == MeshKind::Fbx
+                && let Some(source) = &model.source
+            {
+                *references.entry(source.clone()).or_insert(0) += 1;
+            }
+        }
+        self.assets.set_references(references.clone())?;
+        self.fbx_meshes
+            .retain(|path, _| references.contains_key(path));
+        self.assets.poll()?;
+        if preload {
+            let missing: Vec<String> = references
+                .keys()
+                .filter(|path| !self.fbx_meshes.contains_key(*path))
+                .cloned()
+                .collect();
+            self.assets.preload(&missing)?;
+            self.assets.poll()?;
+        }
         for entity in world.entities.values() {
             let Some(model) = &entity.model else {
                 continue;
@@ -736,9 +849,17 @@ impl GpuRenderer {
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("entity {} has no FBX source", entity.id))?;
             if !self.fbx_meshes.contains_key(source) {
-                let path = crate::workspace_path(source)?;
-                let mesh = load_fbx(&path)?;
-                self.fbx_meshes.insert(source.to_string(), mesh);
+                if let Some(error) = self.assets.error(source) {
+                    bail!("could not load FBX asset '{source}': {error}");
+                }
+                if !preload {
+                    self.assets.load(source)?;
+                }
+                if let Some(mesh) = self.assets.get(source) {
+                    self.fbx_meshes.insert(source.to_string(), mesh);
+                } else {
+                    continue;
+                }
             }
             let rebuild = self
                 .fbx_objects
@@ -825,7 +946,7 @@ impl GpuRenderer {
             timing.frame_index += 1;
         }
         let preparation_started = Instant::now();
-        self.prepare_fbx_objects(world)?;
+        self.prepare_fbx_objects(world, false)?;
         build_vertices(world, &mut self.sprite_vertices, &mut self.sprite_order);
         for quad in &self.overlay_quads {
             push_rectangle(
@@ -990,9 +1111,16 @@ impl GpuRenderer {
                 32,
             );
         }
+        let capture = self
+            .capture_path
+            .take()
+            .map(|path| (path, self.prepare_capture(&mut encoder, &output.texture)));
         self.last_preparation_time = preparation_started.elapsed();
         self.queue.submit(Some(encoder.finish()));
         self.read_gpu_samples()?;
+        if let Some((path, (buffer, padded_bytes_per_row))) = capture {
+            self.save_capture(&buffer, padded_bytes_per_row, &path)?;
+        }
         self.queue.present(output);
         Ok(RenderStatus::Rendered)
     }

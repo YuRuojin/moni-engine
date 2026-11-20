@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -18,8 +18,19 @@ use crate::plugins::{RenderPlugin, SimulationPlugin};
 use crate::profile::Profile;
 
 pub fn run(args: Vec<String>) -> anyhow::Result<()> {
+    run_internal(args, None)
+}
+
+pub fn run_with_profile(args: Vec<String>, profile: Profile) -> anyhow::Result<()> {
+    run_internal(args, Some(profile))
+}
+
+fn run_internal(args: Vec<String>, profile_override: Option<Profile>) -> anyhow::Result<()> {
     let mut script = None;
     let mut scene = "2d";
+    let mut world_path = None;
+    let mut profile_name = "default".to_string();
+    let mut revocations = Vec::new();
     let mut frame_limit = 0_u64;
     let mut benchmark = false;
     let mut warmup_frames = 0_u64;
@@ -43,6 +54,29 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
                 if scene != "2d" && scene != "3d" {
                     bail!("--scene must be 2d or 3d");
                 }
+            }
+            "--world" => {
+                index += 1;
+                world_path = Some(
+                    args.get(index)
+                        .ok_or_else(|| anyhow::anyhow!("--world requires a path"))?
+                        .clone(),
+                );
+            }
+            "--profile" => {
+                index += 1;
+                profile_name = args
+                    .get(index)
+                    .ok_or_else(|| anyhow::anyhow!("--profile requires a name"))?
+                    .clone();
+            }
+            "--revoke" => {
+                index += 1;
+                revocations.push(
+                    args.get(index)
+                        .ok_or_else(|| anyhow::anyhow!("--revoke requires ID=PERMISSION"))?
+                        .clone(),
+                );
             }
             "--frames" => {
                 index += 1;
@@ -90,22 +124,47 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
         bail!("--warmup and --output require --benchmark");
     }
 
-    let script = script.unwrap_or_else(|| "examples/dist/model-orbit.js".to_string());
-    let script_path = crate::workspace_path(&script)?;
-    let source = std::fs::read_to_string(&script_path).with_context(|| {
-        format!(
-            "could not read {}; run 'npm install && npm run build' first",
-            script_path.display()
-        )
-    })?;
-    let engine = if scene == "3d" {
-        crate::demo_engine_3d(source)?
+    if world_path.is_some() {
+        scene = "world";
+    }
+    let engine = if let Some(world_path) = world_path {
+        let path = if Path::new(&world_path).is_absolute() {
+            PathBuf::from(&world_path)
+        } else {
+            crate::workspace_path(&world_path)?
+        };
+        let world = crate::scene::load_scene(&path)?;
+        let mut engine = Engine::new();
+        engine.load_world(world)?;
+        engine
     } else {
-        crate::demo_engine(source)?
+        let script = script.unwrap_or_else(|| "examples/dist/model-orbit.js".to_string());
+        let script_path = crate::workspace_path(&script)?;
+        let source = std::fs::read_to_string(&script_path).with_context(|| {
+            format!(
+                "could not read {}; run 'npm install && npm run build' first",
+                script_path.display()
+            )
+        })?;
+        if scene == "3d" {
+            crate::demo_engine_3d(source)?
+        } else {
+            crate::demo_engine(source)?
+        }
     };
     let event_loop = EventLoop::new().context("could not create the window event loop")?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = ClientApp::new(engine, frame_limit, benchmark, warmup_frames)?;
+    let mut profile = match profile_override {
+        Some(profile) => profile,
+        None => Profile::named(&profile_name)?,
+    };
+    for revocation in revocations {
+        let (plugin, permission) = revocation
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--revoke must use ID=PERMISSION"))?;
+        profile = profile.with_revoked_permission(plugin, permission);
+    }
+    let mut app = ClientApp::new(engine, frame_limit, benchmark, warmup_frames, profile)?;
     event_loop
         .run_app(&mut app)
         .context("the window event loop failed")?;
@@ -226,6 +285,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
 
 struct ClientApp {
     host: PluginHost,
+    profile: Profile,
     simulation_handle: Option<PluginHandle>,
     window: Option<Arc<Window>>,
     last_update: Instant,
@@ -245,9 +305,11 @@ impl ClientApp {
         frame_limit: u64,
         collect_benchmark: bool,
         warmup_frames: u64,
+        profile: Profile,
     ) -> anyhow::Result<Self> {
         let mut host = PluginHost::new(engine);
-        let simulation_handle = Profile::named("default")?
+        let simulation_handle = profile
+            .clone()
             .with_patch("core.render", false)
             .with_patch("core.fbx", false)
             .instantiate(&mut host, None, false)?
@@ -260,6 +322,7 @@ impl ClientApp {
         };
         Ok(Self {
             host,
+            profile,
             simulation_handle,
             window: None,
             last_update: Instant::now(),
@@ -313,14 +376,15 @@ impl ApplicationHandler for ClientApp {
         match event_loop.create_window(attributes) {
             Ok(window) => {
                 let window = Arc::new(window);
-                let result = Profile::named("default")
-                    .and_then(|profile| {
-                        profile.with_patch("core.simulation", false).instantiate(
-                            &mut self.host,
-                            Some(Arc::clone(&window)),
-                            self.collect_benchmark,
-                        )
-                    })
+                let result = self
+                    .profile
+                    .clone()
+                    .with_patch("core.simulation", false)
+                    .instantiate(
+                        &mut self.host,
+                        Some(Arc::clone(&window)),
+                        self.collect_benchmark,
+                    )
                     .and_then(|_| self.host.run_stage(SystemStage::Startup));
                 match result {
                     Ok(()) => {

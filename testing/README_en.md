@@ -36,6 +36,18 @@ npm run benchmark -- --label baseline --frames 600 --warmup 120
 
 The command builds a release binary, loads two FBX files and orthographic/perspective `.mnsc` scenes from `testing/assets/`, runs simulation and real window rendering, and writes raw millisecond samples plus p50/p95/p99 under `target/benchmarks/baseline/`. Simulation measures `Engine::step(1)` and event draining. Total render time includes present/vsync waits; preparation separately covers vertices, uniforms, model matrices, and vertex-buffer operations. When supported, main/shadow-pass GPU timestamps are sampled every 30 frames; synchronous readback is used only for benchmarks.
 
+## Asset and plugin-directory verification
+
+Asynchronous worker preload, nonblocking runtime collection, cooked conversion, and `.mnec` scene loading are verified. A mixed cooked/FBX scene still loads 1,975,083 vertices. FBX, wgpu, QuickJS, and scene-viewer implementations now live in their official plugin directories.
+
+## Independent project verification
+
+`moni new` created an independent Git project, which completed `npm ci`, TypeScript build, real client startup, doctor, and profile dump from its own directory. Doctor rejected a modified lockfile, then `doctor --update-lock` repaired it and verification passed again.
+
+## Profile composition verification
+
+Effective trees and real instantiation are exercised for `default`, `editor`, `minimal`, and `headless`. Minimal/headless initialize no GPU, QuickJS, or FBX; patches remove default plugins, and an invalid default-headless combination fails explicitly. Release benchmarks remain in the existing range.
+
 ## Plugin host verification
 
 The real client and viewer start, tick, and render through the static host, and the simulation plugin is disposed through a `PluginHandle`. Shutdown cleans QuickJS and GPU resources. Cross-stage startup dependencies, rendering, and release benchmarks have been exercised.
@@ -44,6 +56,17 @@ The real client and viewer start, tick, and render through the static host, and 
 
 `cargo run -- scene <INPUT.mnsc> --output <OUTPUT.mnsc>` performs scene migration and round-trip serialization. Current checks cover v1→v2, repeated round-trip consistency, nested unknown-component preservation, script paths, snapshot v1 upgrades, and `capabilities.components` queries.
 
+## Compatibility, golden, and stability tools
+
+```bash
+npm run test:compat
+npm run test:soak
+```
+
+`test:compat` covers manifest/API contracts, profile order, headless/minimal, permission denial, scene migration, corrupt FBX process isolation, and identical pixels across two golden captures. `test:soak` runs 1200 frames by default and samples process working set on Windows; raw output is `target/testing/soak-report.json`.
+
+Golden captures use raw RGBA pixels and JSON metadata, without a cross-GPU tolerance map. Corrupt-input checks are fixed smoke cases rather than continuous fuzzing. The 1200-frame run is a stability smoke test, not long-run release certification.
+
 ## Current limitations
 
-There is no formal unit test suite, plugin compatibility kit, golden rendering, or importer fuzzing; `cargo test` currently proves only that the test target compiles. CPU and supported-GPU baselines exist, but memory curves, a scene matrix, and cross-platform benchmarks do not.
+There is no formal unit test suite or full third-party certification service; `cargo test` currently proves only that the test target compiles. CPU/GPU benchmarks, golden captures, and memory sampling exist, but a scene matrix and cross-platform benchmarks do not.

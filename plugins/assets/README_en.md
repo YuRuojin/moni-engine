@@ -28,6 +28,10 @@ The current static FBX importer in `src/fbx.rs` supports geometry triangulation,
 - Untrusted or complex parsers should prefer isolated processes; parse failures must not crash the editor or player runtime.
 - Game packages contain validated dependencies only and never depend on absolute development-machine paths.
 
-## Current limitations
+## Current implementations
 
-Only synchronous FBX import and renderer-owned caches exist. Initialization preloads the current world, but adding or replacing a model still blocks the render thread. There is no asset database, textures, animation, virtual resource paths, asynchronous loading, persistent cache, dependency graph, or asset packaging.
+- [`fbx/`](fbx/README_en.md): FBX geometry, normals, node transforms, and material base colors.
+- [`runtime/`](runtime/README_en.md): bounded asynchronous loading, shared references, cancellation, timeout, and caching.
+- [`cooked/`](cooked/README_en.md): `.mnec` static geometry I/O and FBX conversion.
+
+Initialization preloads through the same worker, while new models arrive through nonblocking `poll`. There is no asset database, textures, animation, virtual resource paths, persistent import cache, dependency graph, or complete asset package; cooked files are still read individually.
