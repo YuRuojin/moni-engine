@@ -21,7 +21,11 @@
       "shadows": true
     }
   ],
-  "extensions": {},
+  "extensions": {
+    "res": {
+      "terrain": "testing/assets/benchmark.mnec"
+    }
+  },
   "entities": [
     {
       "id": 1,
@@ -30,7 +34,7 @@
         "core.transform": { "x": 0.0, "y": 0.0, "rotation": 0.0 },
         "core.model": {
           "type": "fbx",
-          "source": "testing/assets/benchmark.mnec",
+          "source": "res://terrain",
           "transform": {
             "position": { "x": 0.0, "y": 0.0, "z": 0.0 },
             "rotation": { "x": 0.0, "y": 0.0, "z": 0.0 },

@@ -87,6 +87,7 @@ pub struct ScriptHost {
     command_limit_hit: Rc<Cell<bool>>,
     log_limit_hit: Rc<Cell<bool>>,
     deadline: Rc<Cell<Instant>>,
+    logic_thread: std::thread::ThreadId,
 }
 
 impl std::fmt::Debug for ScriptHost {
@@ -164,7 +165,19 @@ impl ScriptHost {
             command_limit_hit,
             log_limit_hit,
             deadline,
+            logic_thread: std::thread::current().id(),
         })
+    }
+
+    /// QuickJS runtimes are pinned to the logic thread. `Rc` fields already
+    /// make `ScriptHost` `!Send`; this assertion keeps that contract explicit
+    /// for code paths that stay on one thread by construction.
+    pub fn assert_logic_thread(&self) {
+        assert_eq!(
+            std::thread::current().id(),
+            self.logic_thread,
+            "ScriptHost must stay on the logic thread that created it"
+        );
     }
 
     pub fn run_tick(

@@ -86,7 +86,7 @@ fn print_help() -> anyhow::Result<()> {
         "moni-engine\n\nCommands:\n  cook INPUT [--output PATH] [--isolate]
                             Convert FBX to a cooked .mnec mesh
   new PATH                  Create an independent game repository\n  run [--frames N]          Build and run the project in the current directory\n  doctor [--update-lock] [--rollback-lock] [--accept-permissions]
-                            Validate project, scene, profile, and lockfile\n  capabilities              Print the machine-readable control schema\n  serve                     Serve NDJSON requests on stdin/stdout\n  headless [--profile NAME] [--scene PATH]\n                            Resolve and inspect a headless profile\n  profile [list|dump] [--profile NAME] [--patch ID=on|off]\n                            Inspect profiles and effective plugin trees\n  client [--scene 2d|3d] [--script PATH] [--frames N]\n         [--benchmark --warmup N --output PATH]\n                            Open the winit/wgpu client\n  editor [--scene PATH] [--frames N]\n                            Open the read-only .mnsc scene viewer\n  scene PATH [--output PATH] [--name NAME]\n                            Migrate and round-trip a .mnsc scene\n  benchmark [--scene 2d|3d] [--script PATH] [--frames N]\n            [--warmup N] [--output PATH]\n                            Measure release simulation ticks\n  demo [--ticks N] [--output PATH] [--snapshot PATH] [--script PATH]\n\nScript workflow:\n  npm install\n  npm run build\n  cargo run -- client\n  cargo run -- client --scene 3d\n  npm run benchmark"
+                            Validate project, scene, profile, and lockfile\n  capabilities              Print the machine-readable control schema\n  serve                     Serve NDJSON requests on stdin/stdout\n  headless [--profile NAME] [--scene PATH]\n                            Resolve and inspect a headless profile\n  profile [list|dump] [--profile NAME] [--patch ID=on|off]\n                            Inspect profiles and effective plugin trees\n  client [--scene 2d|3d] [--script PATH] [--frames N]\n         [--benchmark --warmup N --output PATH] [--hot-reload]\n                            Open the winit/wgpu client\n  editor [--scene PATH] [--frames N] [--hot-reload]\n                            Open the read-only .mnsc scene viewer\n  scene PATH [--output PATH] [--name NAME]\n                            Migrate and round-trip a .mnsc scene\n  benchmark [--scene 2d|3d] [--script PATH] [--frames N]\n            [--warmup N] [--output PATH]\n                            Measure release simulation ticks\n  demo [--ticks N] [--output PATH] [--snapshot PATH] [--script PATH]\n\nScript workflow:\n  npm install\n  npm run build\n  cargo run -- client\n  cargo run -- client --scene 3d\n  npm run benchmark"
     );
     Ok(())
 }
@@ -388,7 +388,7 @@ fn headless(args: Vec<String>) -> anyhow::Result<()> {
     let mut host = host::PluginHost::new(engine);
     let profile = profile::Profile::named(&profile_name)?;
     let effective = profile.resolve(&profile::Target::current())?;
-    profile.instantiate(&mut host, None, false)?;
+    profile.instantiate(&mut host, None, false, false)?;
     host.run_stage(host::SystemStage::Startup)?;
     let gpu_initialized = host.has_plugin(plugins::RenderPlugin::ID);
     let quickjs_initialized =

@@ -33,6 +33,7 @@ fn run_internal(args: Vec<String>, profile_override: Option<Profile>) -> anyhow:
     let mut revocations = Vec::new();
     let mut frame_limit = 0_u64;
     let mut benchmark = false;
+    let mut hot_reload = false;
     let mut warmup_frames = 0_u64;
     let mut output = None;
     let mut index = 0;
@@ -90,6 +91,7 @@ fn run_internal(args: Vec<String>, profile_override: Option<Profile>) -> anyhow:
                 }
             }
             "--benchmark" => benchmark = true,
+            "--hot-reload" => hot_reload = true,
             "--warmup" => {
                 index += 1;
                 warmup_frames = args
@@ -119,6 +121,9 @@ fn run_internal(args: Vec<String>, profile_override: Option<Profile>) -> anyhow:
         }
         if warmup_frames >= frame_limit {
             bail!("--warmup must be smaller than --frames");
+        }
+        if hot_reload {
+            bail!("--hot-reload must not be combined with --benchmark");
         }
     } else if warmup_frames != 0 || output.is_some() {
         bail!("--warmup and --output require --benchmark");
@@ -164,7 +169,14 @@ fn run_internal(args: Vec<String>, profile_override: Option<Profile>) -> anyhow:
             .ok_or_else(|| anyhow::anyhow!("--revoke must use ID=PERMISSION"))?;
         profile = profile.with_revoked_permission(plugin, permission);
     }
-    let mut app = ClientApp::new(engine, frame_limit, benchmark, warmup_frames, profile)?;
+    let mut app = ClientApp::new(
+        engine,
+        frame_limit,
+        benchmark,
+        warmup_frames,
+        profile,
+        hot_reload,
+    )?;
     event_loop
         .run_app(&mut app)
         .context("the window event loop failed")?;
@@ -294,6 +306,7 @@ struct ClientApp {
     rendered_frames: u64,
     collect_benchmark: bool,
     warmup_frames: u64,
+    hot_reload: bool,
     frame_samples: Vec<f64>,
     preparation_samples: Vec<f64>,
     title_state: Option<(u64, usize, usize)>,
@@ -307,13 +320,14 @@ impl ClientApp {
         collect_benchmark: bool,
         warmup_frames: u64,
         profile: Profile,
+        hot_reload: bool,
     ) -> anyhow::Result<Self> {
         let mut host = PluginHost::new(engine);
         let simulation_handle = profile
             .clone()
             .with_patch("core.render", false)
             .with_patch("core.fbx", false)
-            .instantiate(&mut host, None, false)?
+            .instantiate(&mut host, None, false, false)?
             .into_iter()
             .find(|handle| handle.id() == SimulationPlugin::ID);
         let sample_capacity = if collect_benchmark {
@@ -332,6 +346,7 @@ impl ClientApp {
             rendered_frames: 0,
             collect_benchmark,
             warmup_frames,
+            hot_reload,
             frame_samples: Vec::with_capacity(sample_capacity),
             preparation_samples: Vec::with_capacity(sample_capacity),
             title_state: None,
@@ -386,6 +401,7 @@ impl ApplicationHandler for ClientApp {
                         &mut self.host,
                         Some(Arc::clone(&window)),
                         self.collect_benchmark,
+                        self.hot_reload,
                     )
                     .and_then(|_| self.host.run_stage(SystemStage::Startup));
                 match result {

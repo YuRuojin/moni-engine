@@ -265,6 +265,7 @@ impl Profile {
         host: &mut PluginHost,
         window: Option<Arc<Window>>,
         collect_gpu_timestamps: bool,
+        hot_reload: bool,
     ) -> Result<Vec<PluginHandle>, PluginError> {
         let effective = self.resolve(&Target::current())?;
         // Capability providers such as core.fbx contribute permissions without a
@@ -300,6 +301,7 @@ impl Profile {
                             window,
                             collect_gpu_timestamps,
                             effective.contains("core.fbx"),
+                            hot_reload,
                         )) as Box<dyn Plugin>,
                     ));
                 }
@@ -508,7 +510,7 @@ mod tests {
         let mut host = PluginHost::new(Engine::new());
         let profile = Profile::named("default").expect("default profile");
         let error = profile
-            .instantiate(&mut host, None, false)
+            .instantiate(&mut host, None, false, false)
             .expect_err("core.render requires a window");
         assert!(error.to_string().contains("requires a window"));
         assert!(!host.has_plugin("core.simulation"));
@@ -522,7 +524,7 @@ mod tests {
             .expect("default profile")
             .with_patch("core.render", false);
         let handles = profile
-            .instantiate(&mut host, None, false)
+            .instantiate(&mut host, None, false, false)
             .expect("simulation-only instantiate");
         assert_eq!(handles.len(), 1);
         assert!(host.has_plugin("core.simulation"));
@@ -540,7 +542,7 @@ mod tests {
         let mut host = PluginHost::new(Engine::new());
         let handles = Profile::named("minimal")
             .expect("minimal profile")
-            .instantiate(&mut host, None, false)
+            .instantiate(&mut host, None, false, false)
             .expect("minimal instantiate");
         assert!(handles.is_empty());
         assert!(!host.has_plugin("core.simulation"));

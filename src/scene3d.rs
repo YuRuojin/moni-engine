@@ -110,6 +110,23 @@ fn default_model_color() -> String {
     "#ffffff".to_string()
 }
 
+/// `res://<alias>` virtual asset paths bypass the extension check; the alias
+/// itself follows the same character rules as the scene `extensions.res`
+/// table and resolves through it at load time.
+fn source_is_virtual_alias(source: &str) -> bool {
+    match source.strip_prefix("res://") {
+        Some(alias) => {
+            !alias.is_empty()
+                && alias.len() <= 64
+                && !alias.contains("..")
+                && alias.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+                })
+        }
+        None => false,
+    }
+}
+
 impl Model3d {
     pub fn validate(&self) -> Result<(), EngineError> {
         self.transform.validate()?;
@@ -131,14 +148,15 @@ impl Model3d {
         }
         match (&self.kind, &self.source) {
             (MeshKind::Fbx, Some(source))
-                if !source.is_empty()
-                    && source.len() <= 256
-                    && (source.to_ascii_lowercase().ends_with(".fbx")
-                        || source.to_ascii_lowercase().ends_with(".mnec")) => {}
+                if source_is_virtual_alias(source)
+                    || (!source.is_empty()
+                        && source.len() <= 256
+                        && (source.to_ascii_lowercase().ends_with(".fbx")
+                            || source.to_ascii_lowercase().ends_with(".mnec"))) => {}
             (MeshKind::Fbx, _) => {
                 return Err(EngineError::new(
                     "invalid_model_3d",
-                    "FBX models require a workspace-relative .fbx or .mnec source path",
+                    "FBX models require a workspace-relative .fbx or .mnec source path or a res://<alias> virtual path",
                 ));
             }
             (_, Some(_)) => {

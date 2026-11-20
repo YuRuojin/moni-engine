@@ -84,13 +84,29 @@ v1 `transform`, `sprite`, `model`, and `script` migrate to `core.transform`, `co
 
 Runtime snapshots also accept v1 and v2: migration adds root and entity `extensions`, with current `SNAPSHOT_VERSION` 2. External script `source` paths survive scene round trips unchanged.
 
+## Virtual asset paths
+
+Root-level `extensions.res` declares the virtual asset alias table, mapping aliases to workspace-relative paths:
+
+```json
+{
+  "extensions": {
+    "res": {
+      "terrain": "testing/assets/benchmark.mnec"
+    }
+  }
+}
+```
+
+`core.model` `source` fields can then use `res://terrain`. The alias is the asset's stable identity: moving the physical file or switching to the cooked format only updates the alias table, while scenes and cache keys stay unchanged. Aliases are 1-64 letters, digits, `-`, `_`, or `.` with no `..`; targets must be workspace-relative paths. The loader parses the table once at scene load and caches it on the world, so render frames never touch JSON. `core.script` `source` still uses physical relative paths and does not participate in virtual addressing.
+
 ## Round-trip command
 
 ```bash
-cargo run -- scene testing/assets/perspective.mnsc --output target/roundtrip.mnsc --name example
+cargo run -- scene testing/assets/benchmark-3d.mnsc --output target/roundtrip.mnsc --name example
 ```
 
-This loads, validates, and saves a scene to verify migration and unknown-data preservation. Runnable examples are `testing/assets/orthographic.mnsc` and `testing/assets/perspective.mnsc`.
+This loads, validates, and saves a scene to verify migration, alias tables, and unknown-data preservation. Runnable examples are the committed `testing/assets/benchmark-2d.mnsc` and `testing/assets/benchmark-3d.mnsc`.
 
 ## Current boundaries
 

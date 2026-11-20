@@ -298,6 +298,11 @@ pub struct World {
     pub lights: Vec<Light>,
     #[serde(default)]
     pub extensions: BTreeMap<String, Value>,
+    /// Virtual asset aliases (`res://<alias>` → workspace-relative path),
+    /// parsed from scene `extensions.res` at load time so per-frame asset
+    /// resolution never touches JSON.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub asset_aliases: BTreeMap<String, String>,
     #[serde(default)]
     pub entities: BTreeMap<EntityId, Entity>,
 }
@@ -334,6 +339,7 @@ impl Default for World {
             camera: Camera3d::default(),
             lights: default_lights(),
             extensions: BTreeMap::new(),
+            asset_aliases: BTreeMap::new(),
             entities: BTreeMap::new(),
         }
     }
@@ -734,10 +740,12 @@ impl Engine {
         {
             entry.insert(ScriptHost::new(source)?);
         }
-        self.script_hosts
+        let host = self
+            .script_hosts
             .get_mut(&entity.id)
-            .expect("script host was inserted")
-            .run_tick(entity, tick, dt)
+            .expect("script host was inserted");
+        host.assert_logic_thread();
+        host.run_tick(entity, tick, dt)
     }
 
     fn collect_script_output(

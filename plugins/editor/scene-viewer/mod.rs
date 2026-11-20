@@ -21,6 +21,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
     let mut scene_path = "testing/assets/benchmark-3d.mnsc".to_string();
     let mut golden_path = None;
     let mut frame_limit = 0_u64;
+    let mut hot_reload = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -31,6 +32,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("--scene requires a path"))?
                     .clone();
             }
+            "--hot-reload" => hot_reload = true,
             "--golden" => {
                 index += 1;
                 golden_path = Some(crate::workspace_path(
@@ -63,7 +65,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
     host.world_mut().viewport.height = 540;
     let event_loop = EventLoop::new().context("could not create the editor event loop")?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = EditorApp::new(host, scene_path, frame_limit, golden_path);
+    let mut app = EditorApp::new(host, scene_path, frame_limit, golden_path, hot_reload);
     event_loop
         .run_app(&mut app)
         .context("the editor event loop failed")?;
@@ -96,6 +98,7 @@ struct EditorApp {
     frame_limit: u64,
     frames: u64,
     frame_ms: f64,
+    hot_reload: bool,
     gpu_samples: Vec<(f32, f32)>,
     golden_mode: bool,
     golden_path: Option<PathBuf>,
@@ -108,6 +111,7 @@ impl EditorApp {
         scene_path: String,
         frame_limit: u64,
         golden_path: Option<PathBuf>,
+        hot_reload: bool,
     ) -> Self {
         Self {
             initial_camera: host.world().camera.clone(),
@@ -117,6 +121,7 @@ impl EditorApp {
             frame_limit,
             frames: 0,
             frame_ms: 0.0,
+            hot_reload,
             gpu_samples: Vec::new(),
             golden_mode: golden_path.is_some(),
             golden_path,
@@ -170,7 +175,12 @@ impl ApplicationHandler for EditorApp {
                 let window = Arc::new(window);
                 let result = Profile::named("editor")
                     .and_then(|profile| {
-                        profile.instantiate(&mut self.host, Some(Arc::clone(&window)), true)
+                        profile.instantiate(
+                            &mut self.host,
+                            Some(Arc::clone(&window)),
+                            true,
+                            self.hot_reload,
+                        )
                     })
                     .and_then(|_| self.host.run_stage(SystemStage::Startup));
                 match result {

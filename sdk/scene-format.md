@@ -84,13 +84,29 @@ v1 的 `transform`、`sprite`、`model`、`script` 分别迁移到 `core.transfo
 
 运行时快照同样读取 v1 和 v2：升级时增加根与实体 `extensions`，当前 `SNAPSHOT_VERSION` 为 2。`source` 外部脚本路径在场景往返中保留，不会被无意义地改写。
 
+## 虚拟资源路径
+
+根级 `extensions.res` 声明虚拟资源别名表，别名映射到 workspace 相对路径：
+
+```json
+{
+  "extensions": {
+    "res": {
+      "terrain": "testing/assets/benchmark.mnec"
+    }
+  }
+}
+```
+
+`core.model` 的 `source` 随后可以使用 `res://terrain`。别名即资源的稳定标识：物理文件移动或改用 cooked 格式时只需更新别名表，场景与缓存键保持不变。别名限定 1-64 个字母、数字、`-`、`_`、`.`，不允许 `..`；目标路径必须是 workspace 相对路径。加载器在场景加载时解析别名表并缓存到世界，渲染帧内不做 JSON 解析。`core.script` 的 `source` 仍使用物理相对路径，不走虚拟寻址。
+
 ## 往返命令
 
 ```bash
-cargo run -- scene testing/assets/perspective.mnsc --output target/roundtrip.mnsc --name example
+cargo run -- scene testing/assets/benchmark-3d.mnsc --output target/roundtrip.mnsc --name example
 ```
 
-该命令加载、校验并保存场景，可用于验证迁移和未知数据保留。可运行示例位于 `testing/assets/orthographic.mnsc` 和 `testing/assets/perspective.mnsc`。
+该命令加载、校验并保存场景，可用于验证迁移、别名表和未知数据保留。可运行示例位于已入库的 `testing/assets/benchmark-2d.mnsc` 和 `testing/assets/benchmark-3d.mnsc`。
 
 ## 当前边界
 

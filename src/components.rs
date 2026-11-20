@@ -98,6 +98,22 @@ impl PropertyField {
                 if path.is_empty() || path.len() > 256 {
                     return Err("path must contain 1 to 256 characters".into());
                 }
+                if let Some(alias) = path.strip_prefix("res://") {
+                    if alias.is_empty()
+                        || alias.len() > 64
+                        || alias.contains("..")
+                        || !alias.chars().all(|character| {
+                            character.is_ascii_alphanumeric()
+                                || matches!(character, '-' | '_' | '.')
+                        })
+                    {
+                        return Err(
+                            "virtual asset alias must be 1-64 letters, digits, '-', or '.' without '..'"
+                                .into(),
+                        );
+                    }
+                    return Ok(());
+                }
                 let path = Path::new(path);
                 if path.is_absolute()
                     || path.components().any(|component| {
@@ -454,4 +470,61 @@ fn schema(
 
 fn number(name: &'static str, default: f64) -> PropertyField {
     PropertyField::new(name, PropertyType::Number, false).default(json!(default))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn path_field() -> PropertyField {
+        PropertyField::new("source", PropertyType::Path, false)
+    }
+
+    #[test]
+    fn virtual_asset_paths_pass_validation() {
+        assert!(path_field().validate(&json!("res://terrain")).is_ok());
+        assert!(path_field().validate(&json!("res://hero.mesh")).is_ok());
+    }
+
+    #[test]
+    fn invalid_virtual_asset_paths_fail_validation() {
+        for bad in [
+            "res://",
+            "res://..",
+            "res://a..b",
+            "res://a/b",
+            "res://a\\b",
+            "res://has space",
+            "res://<script>",
+        ] {
+            assert!(
+                path_field().validate(&json!(bad)).is_err(),
+                "'{bad}' should fail validation"
+            );
+        }
+    }
+
+    #[test]
+    fn physical_paths_still_validate() {
+        assert!(path_field().validate(&json!("assets/hero.mnec")).is_ok());
+        assert!(path_field().validate(&json!("../outside.mnec")).is_err());
+        assert!(path_field().validate(&json!("C:/outside.mnec")).is_err());
+    }
+
+    #[test]
+    fn core_model_accepts_virtual_source() {
+        let registry = ComponentRegistry::new();
+        let descriptor = registry
+            .resolve("core.model")
+            .expect("core.model registered");
+        let value = descriptor
+            .deserialize(&json!({ "type": "fbx", "source": "res://terrain" }))
+            .expect("virtual source validates");
+        match value {
+            ComponentValue::Model(model) => {
+                assert_eq!(model.source.as_deref(), Some("res://terrain"));
+            }
+            other => panic!("unexpected component value {other:?}"),
+        }
+    }
 }

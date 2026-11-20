@@ -1,14 +1,26 @@
 use std::collections::BTreeMap;
+use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::fbx::FbxMesh;
 
 pub const MAX_ASSET_QUEUE: usize = 64;
 pub const ASSET_TIMEOUT: Duration = Duration::from_secs(10);
+/// Virtual asset paths use this scheme: `res://<alias>` resolves through the
+/// alias table declared in scene `extensions.res`, so scenes keep stable
+/// identities even when physical files move.
+pub const VIRTUAL_ASSET_SCHEME: &str = "res://";
+
+/// A cached mesh together with the revision it was loaded at. Renderers
+/// compare revisions to detect hot reloads without per-frame parsing.
+pub struct AssetHandle {
+    pub mesh: Arc<FbxMesh>,
+    pub revision: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AssetKind {
@@ -48,12 +60,24 @@ pub struct AssetRuntime {
     cache: BTreeMap<String, Arc<FbxMesh>>,
     references: BTreeMap<String, usize>,
     errors: BTreeMap<String, String>,
+    aliases: BTreeMap<String, String>,
+    fingerprints: BTreeMap<String, (SystemTime, u64)>,
+    revisions: BTreeMap<String, u64>,
     next_id: u64,
+    next_revision: u64,
+    hot_reload: bool,
     shutdown: bool,
 }
 
 impl AssetRuntime {
     pub fn new() -> Self {
+        Self::new_with_options(false)
+    }
+
+    /// `hot_reload` enables mtime+size fingerprint checks during `poll` for
+    /// referenced, cached assets. Players and shipping builds keep it off so
+    /// they pay zero per-frame stat cost.
+    pub fn new_with_options(hot_reload: bool) -> Self {
         let (sender, request_receiver) = mpsc::sync_channel(MAX_ASSET_QUEUE);
         let (response_sender, receiver) = mpsc::sync_channel(MAX_ASSET_QUEUE);
         let worker = std::thread::Builder::new()
@@ -69,8 +93,35 @@ impl AssetRuntime {
             cache: BTreeMap::new(),
             references: BTreeMap::new(),
             errors: BTreeMap::new(),
+            aliases: BTreeMap::new(),
+            fingerprints: BTreeMap::new(),
+            revisions: BTreeMap::new(),
             next_id: 1,
+            next_revision: 1,
+            hot_reload,
             shutdown: false,
+        }
+    }
+
+    /// Installs the virtual alias table. `res://<alias>` asset paths resolve
+    /// through it while keeping the alias as their stable cache identity.
+    pub fn set_aliases(&mut self, aliases: &BTreeMap<String, String>) {
+        if self.aliases != *aliases {
+            self.aliases = aliases.clone();
+        }
+    }
+
+    fn resolve_physical(&self, path: &str) -> anyhow::Result<String> {
+        match path.strip_prefix(VIRTUAL_ASSET_SCHEME) {
+            Some(alias) => self.aliases.get(alias).map_or_else(
+                || {
+                    anyhow::bail!(
+                        "unknown virtual asset path '{path}'; declare it under scene extensions.res"
+                    )
+                },
+                |physical| Ok(physical.clone()),
+            ),
+            None => Ok(path.to_string()),
         }
     }
 
@@ -84,8 +135,9 @@ impl AssetRuntime {
         {
             return Ok(());
         }
-        let absolute = crate::workspace_path(path)?;
-        let kind = asset_kind(path)?;
+        let physical = self.resolve_physical(path)?;
+        let absolute = crate::workspace_path(&physical)?;
+        let kind = asset_kind(&physical)?;
         let id = self.next_id;
         self.next_id = self
             .next_id
@@ -110,6 +162,11 @@ impl AssetRuntime {
                 cancel,
             },
         );
+        if self.hot_reload
+            && let Ok(fingerprint) = fingerprint(&absolute)
+        {
+            self.fingerprints.insert(path.to_string(), fingerprint);
+        }
         Ok(())
     }
 
@@ -149,11 +206,29 @@ impl AssetRuntime {
             let path = pending.path.clone();
             match response.result {
                 Ok(mesh) => {
+                    let revision = self.next_revision;
+                    self.next_revision = self.next_revision.saturating_add(1);
+                    self.revisions.insert(path.clone(), revision);
+                    self.errors.remove(&path);
                     self.cache.insert(path, mesh);
                 }
                 Err(error) => {
                     self.errors.insert(path, error);
                 }
+            }
+        }
+        if self.hot_reload {
+            for (path, fingerprint) in self.detect_source_changes() {
+                // Drop the cached entry so `load` can queue a replacement;
+                // the renderer keeps serving its previous revision until the
+                // fresh one arrives, so no frame ever blocks or blanks.
+                self.cache.remove(&path);
+                if self.load(&path).is_ok() {
+                    self.fingerprints.insert(path, fingerprint);
+                }
+                // On a bounded-queue rejection the renderer keeps rendering
+                // the previous revision; the unchanged fingerprint means the
+                // next poll retries the reload.
             }
         }
         let now = Instant::now();
@@ -174,6 +249,37 @@ impl AssetRuntime {
         Ok(())
     }
 
+    /// Compares mtime+size fingerprints of referenced, cached assets against
+    /// the values recorded at load time and reports the paths whose source
+    /// file changed on disk.
+    fn detect_source_changes(&mut self) -> Vec<(String, (SystemTime, u64))> {
+        let mut changed = Vec::new();
+        for path in self.references.keys() {
+            if !self.cache.contains_key(path) {
+                continue; // pending or failed; handled through the normal paths
+            }
+            let Ok(physical) = self.resolve_physical(path) else {
+                continue;
+            };
+            let Ok(absolute) = crate::workspace_path(&physical) else {
+                continue;
+            };
+            let Ok(current) = fingerprint(&absolute) else {
+                continue;
+            };
+            match self.fingerprints.get(path) {
+                None => {
+                    self.fingerprints.insert(path.clone(), current);
+                }
+                Some(stored) if *stored != current => {
+                    changed.push((path.clone(), current));
+                }
+                _ => {}
+            }
+        }
+        changed
+    }
+
     pub fn set_references(&mut self, references: BTreeMap<String, usize>) -> anyhow::Result<()> {
         let removed: Vec<String> = self
             .references
@@ -188,8 +294,13 @@ impl AssetRuntime {
         Ok(())
     }
 
-    pub fn get(&self, path: &str) -> Option<Arc<FbxMesh>> {
-        self.cache.get(path).cloned()
+    /// Returns the cached mesh with the revision it was loaded at, or `None`
+    /// while a (re)load is pending or the source failed.
+    pub fn handle(&self, path: &str) -> Option<AssetHandle> {
+        self.cache.get(path).map(|mesh| AssetHandle {
+            mesh: Arc::clone(mesh),
+            revision: self.revisions.get(path).copied().unwrap_or(1),
+        })
     }
 
     pub fn error(&self, path: &str) -> Option<&str> {
@@ -199,6 +310,8 @@ impl AssetRuntime {
     fn unload(&mut self, path: &str) {
         self.cache.remove(path);
         self.errors.remove(path);
+        self.fingerprints.remove(path);
+        self.revisions.remove(path);
         if let Some(id) = self.ids.remove(path)
             && let Some(pending) = self.pending.remove(&id)
         {
@@ -223,6 +336,8 @@ impl AssetRuntime {
         self.cache.clear();
         self.references.clear();
         self.errors.clear();
+        self.fingerprints.clear();
+        self.revisions.clear();
     }
 }
 
@@ -268,5 +383,136 @@ fn asset_kind(path: &str) -> anyhow::Result<AssetKind> {
         Ok(AssetKind::Cooked)
     } else {
         anyhow::bail!("unsupported mesh asset '{path}'; expected .fbx or .mnec")
+    }
+}
+
+/// Cheap content proxy: mtime plus size catches developer edits without
+/// hashing whole files on the frame path.
+fn fingerprint(path: &std::path::Path) -> anyhow::Result<(SystemTime, u64)> {
+    let metadata = fs::metadata(path)?;
+    Ok((metadata.modified()?, metadata.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cooked::write_cooked_mesh;
+    use crate::fbx::{FbxMesh, FbxVertex};
+
+    fn mesh_with_vertices(count: usize) -> FbxMesh {
+        FbxMesh {
+            vertices: (0..count)
+                .map(|index| FbxVertex {
+                    position: [index as f32, 0.0, 0.0],
+                    normal: [0.0, 1.0, 0.0],
+                    color: Some([1.0, 0.0, 0.0, 1.0]),
+                })
+                .collect(),
+        }
+    }
+
+    fn temp_asset_path(label: &str) -> String {
+        let directory = format!("target/testing/asset-test-{}", std::process::id());
+        fs::create_dir_all(&directory).expect("create temp asset directory");
+        format!("{directory}/{label}.mnec")
+    }
+
+    fn wait_for<F: FnMut() -> bool>(mut condition: F) {
+        for _ in 0..2_000 {
+            if condition() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("asset condition never became true");
+    }
+
+    #[test]
+    fn unknown_virtual_alias_is_rejected() {
+        let mut runtime = AssetRuntime::new();
+        let error = runtime
+            .load("res://missing")
+            .expect_err("unknown alias must fail");
+        assert!(error.to_string().contains("unknown virtual asset path"));
+    }
+
+    #[test]
+    fn virtual_alias_loads_and_reports_revision() {
+        let path = temp_asset_path("alias-basic");
+        write_cooked_mesh(std::path::Path::new(&path), &mesh_with_vertices(4))
+            .expect("write cooked fixture");
+        let mut runtime = AssetRuntime::new();
+        runtime.set_aliases(&BTreeMap::from([("mesh".to_string(), path.clone())]));
+        runtime
+            .set_references(BTreeMap::from([("res://mesh".to_string(), 1)]))
+            .expect("set references");
+        runtime.load("res://mesh").expect("queue alias load");
+        wait_for(|| {
+            let _ = runtime.poll();
+            runtime.handle("res://mesh").is_some()
+        });
+        let handle = runtime.handle("res://mesh").expect("mesh loaded");
+        assert_eq!(handle.mesh.vertices.len(), 4);
+        assert_eq!(handle.revision, 1);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn hot_reload_swaps_to_a_new_revision() {
+        let path = temp_asset_path("alias-reload");
+        write_cooked_mesh(std::path::Path::new(&path), &mesh_with_vertices(4))
+            .expect("write cooked fixture");
+        let mut runtime = AssetRuntime::new_with_options(true);
+        runtime.set_aliases(&BTreeMap::from([("mesh".to_string(), path.clone())]));
+        runtime
+            .set_references(BTreeMap::from([("res://mesh".to_string(), 1)]))
+            .expect("set references");
+        runtime.load("res://mesh").expect("queue alias load");
+        wait_for(|| {
+            let _ = runtime.poll();
+            runtime.handle("res://mesh").is_some()
+        });
+        assert_eq!(runtime.handle("res://mesh").unwrap().revision, 1);
+
+        // Rewrite the source with a different vertex count so both mtime and
+        // size change; then poll until the replacement revision arrives.
+        write_cooked_mesh(std::path::Path::new(&path), &mesh_with_vertices(9))
+            .expect("rewrite cooked fixture");
+        wait_for(|| {
+            runtime.poll().is_ok()
+                && runtime
+                    .handle("res://mesh")
+                    .is_some_and(|handle| handle.revision > 1)
+        });
+        let handle = runtime.handle("res://mesh").expect("reloaded mesh");
+        assert_eq!(handle.mesh.vertices.len(), 9);
+        assert_eq!(handle.revision, 2);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn without_hot_reload_source_changes_are_ignored() {
+        let path = temp_asset_path("alias-static");
+        write_cooked_mesh(std::path::Path::new(&path), &mesh_with_vertices(4))
+            .expect("write cooked fixture");
+        let mut runtime = AssetRuntime::new();
+        runtime.set_aliases(&BTreeMap::from([("mesh".to_string(), path.clone())]));
+        runtime
+            .set_references(BTreeMap::from([("res://mesh".to_string(), 1)]))
+            .expect("set references");
+        runtime.load("res://mesh").expect("queue alias load");
+        wait_for(|| {
+            let _ = runtime.poll();
+            runtime.handle("res://mesh").is_some()
+        });
+        write_cooked_mesh(std::path::Path::new(&path), &mesh_with_vertices(9))
+            .expect("rewrite cooked fixture");
+        for _ in 0..20 {
+            runtime.poll().expect("poll");
+        }
+        let handle = runtime.handle("res://mesh").expect("mesh still cached");
+        assert_eq!(handle.revision, 1);
+        assert_eq!(handle.mesh.vertices.len(), 4);
+        fs::remove_file(&path).ok();
     }
 }

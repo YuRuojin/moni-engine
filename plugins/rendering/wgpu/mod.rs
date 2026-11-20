@@ -139,6 +139,7 @@ impl GpuTiming {
 struct FbxGpuObject {
     source: String,
     color: String,
+    revision: u64,
     transform: Transform3d,
     vertex_buffer: wgpu::Buffer,
     vertex_count: u32,
@@ -190,10 +191,11 @@ pub struct GpuRenderer {
     mesh_vertex_buffer: wgpu::Buffer,
     sprite_vertex_capacity: usize,
     mesh_vertex_capacity: usize,
-    fbx_meshes: BTreeMap<String, Arc<FbxMesh>>,
+    fbx_meshes: BTreeMap<String, (Arc<FbxMesh>, u64)>,
     assets: AssetRuntime,
     color_cache: ColorCache,
     failed_assets: BTreeSet<String>,
+    render_thread: std::thread::ThreadId,
     load_fbx_assets: bool,
     gpu_timing: Option<GpuTiming>,
     gpu_samples: Vec<(f32, f32)>,
@@ -207,12 +209,14 @@ impl GpuRenderer {
         world: &World,
         collect_gpu_timestamps: bool,
         load_fbx_assets: bool,
+        hot_reload: bool,
     ) -> anyhow::Result<Self> {
         pollster::block_on(Self::new_async(
             window,
             world,
             collect_gpu_timestamps,
             load_fbx_assets,
+            hot_reload,
         ))
     }
 
@@ -221,7 +225,9 @@ impl GpuRenderer {
         world: &World,
         collect_gpu_timestamps: bool,
         load_fbx_assets: bool,
+        hot_reload: bool,
     ) -> anyhow::Result<Self> {
+        let render_thread = std::thread::current().id();
         let size = window.inner_size();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance
@@ -633,9 +639,10 @@ impl GpuRenderer {
             sprite_vertex_capacity: INITIAL_SPRITE_VERTEX_CAPACITY,
             mesh_vertex_capacity: INITIAL_MESH_VERTEX_CAPACITY,
             fbx_meshes: BTreeMap::new(),
-            assets: AssetRuntime::new(),
+            assets: AssetRuntime::new_with_options(hot_reload),
             color_cache: ColorCache::default(),
             failed_assets: BTreeSet::new(),
+            render_thread,
             load_fbx_assets,
             gpu_timing,
             gpu_samples: Vec::new(),
@@ -663,7 +670,7 @@ impl GpuRenderer {
     pub fn loaded_mesh_vertices(&self) -> usize {
         self.fbx_meshes
             .values()
-            .map(|mesh| mesh.vertices.len())
+            .map(|(mesh, _)| mesh.vertices.len())
             .sum()
     }
 
@@ -829,6 +836,7 @@ impl GpuRenderer {
                 *references.entry(source.clone()).or_insert(0) += 1;
             }
         }
+        self.assets.set_aliases(&world.asset_aliases);
         self.fbx_meshes
             .retain(|path, _| references.contains_key(path));
         let missing = preload.then(|| {
@@ -875,19 +883,39 @@ impl GpuRenderer {
                     let message = format!("could not queue FBX asset '{source}': {error:#}");
                     self.report_asset_failure(source, message);
                 }
-                if let Some(mesh) = self.assets.get(source) {
-                    self.fbx_meshes.insert(source.to_string(), mesh);
-                    self.failed_assets.remove(source);
-                } else {
+                let Some(handle) = self.assets.handle(source) else {
                     continue;
+                };
+                self.fbx_meshes
+                    .insert(source.to_string(), (handle.mesh, handle.revision));
+                self.failed_assets.remove(source);
+            } else if let Some(error) = self.assets.error(source) {
+                // A hot-reload attempt failed; keep rendering the previous
+                // revision and surface the failure once.
+                let message =
+                    format!("hot reload of '{source}' failed, keeping previous version: {error}");
+                self.report_asset_failure(&format!("reload:{source}"), message);
+            }
+            // Swap in a freshly reloaded revision as soon as it arrives; the
+            // vertex buffers rebuild below through the revision mismatch.
+            if let Some(handle) = self.assets.handle(source) {
+                let loaded_revision = self.fbx_meshes[source].1;
+                if handle.revision != loaded_revision {
+                    self.fbx_meshes
+                        .insert(source.to_string(), (handle.mesh, handle.revision));
+                    self.failed_assets.remove(&format!("reload:{source}"));
                 }
             }
-            let rebuild = self
-                .fbx_objects
-                .get(&entity.id)
-                .is_none_or(|object| object.source != source || object.color != model.color);
+            let (mesh, revision) = {
+                let entry = &self.fbx_meshes[source];
+                (Arc::clone(&entry.0), entry.1)
+            };
+            let rebuild = self.fbx_objects.get(&entity.id).is_none_or(|object| {
+                object.source != source
+                    || object.color != model.color
+                    || object.revision != revision
+            });
             if rebuild {
-                let mesh = &self.fbx_meshes[source];
                 let fallback = self.color_cache.get(&model.color);
                 let vertices: Vec<Vertex3d> = mesh
                     .vertices
@@ -917,6 +945,7 @@ impl GpuRenderer {
                     FbxGpuObject {
                         source: source.to_string(),
                         color: model.color.clone(),
+                        revision,
                         transform: model.transform,
                         vertex_buffer,
                         vertex_count: u32::try_from(vertices.len())
@@ -954,6 +983,13 @@ impl GpuRenderer {
     }
 
     pub fn render(&mut self, world: &World) -> anyhow::Result<RenderStatus> {
+        // GPU resources are pinned to the render thread by contract; this
+        // assertion keeps that contract explicit instead of only implicit.
+        assert_eq!(
+            std::thread::current().id(),
+            self.render_thread,
+            "GpuRenderer must stay on the thread that created it"
+        );
         let output = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(output)
             | wgpu::CurrentSurfaceTexture::Suboptimal(output) => output,

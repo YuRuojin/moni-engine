@@ -361,12 +361,14 @@ pub fn capabilities() -> Value {
             "coordinateSystem": "2D pixels with y down; right-handed 3D with y up; rotations in radians",
             "camera3d": "Perspective or orthographic camera with position, target, fov_y, orthographic_height, near and far",
             "meshes3d": ["cube", "plane", "fbx"],
-            "fbxModel": "Workspace-relative .fbx or .mnec source; geometry and base colors use shared GPU caches",
+            "fbxModel": "Workspace-relative or res://<alias> .fbx/.mnec source; geometry and base colors use shared GPU caches",
             "assets": {
                 "formats": ["fbx", "mnec"],
                 "worker": "moni-asset-loader",
                 "queueCapacity": 64,
                 "timeoutSeconds": 10,
+                "virtualPaths": "res://<alias> resolves through scene extensions.res so scenes keep stable asset identities",
+                "hotReload": "opt-in via client/editor --hot-reload; mtime+size fingerprints requeue changed sources through the bounded loader while the previous revision keeps rendering",
                 "runtimeReads": "nonblocking poll after initialization preload"
             },
             "scene": {

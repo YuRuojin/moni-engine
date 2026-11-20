@@ -34,4 +34,4 @@ The current static FBX importer in [`fbx/`](fbx/README_en.md) supports geometry 
 - [`runtime/`](runtime/README_en.md): bounded asynchronous loading, shared references, cancellation, timeout, and caching.
 - [`cooked/`](cooked/README_en.md): `.mnec` static geometry I/O and FBX conversion.
 
-Initialization preloads through the same worker, while new models arrive through nonblocking `poll`. There is no asset database, textures, animation, virtual resource paths, persistent import cache, dependency graph, hot reload, or complete asset package; cooked files are still read individually.
+Initialization preloads through the same worker, while new models arrive through nonblocking `poll`. Virtual asset paths (`res://`, see [`runtime/`](runtime/README_en.md)) and opt-in hot reload are implemented; there is still no asset database, textures, animation, persistent import cache, dependency graph, or complete asset package, and cooked files are read individually.

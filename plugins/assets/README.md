@@ -34,6 +34,6 @@ GPU 上传与材质使用属于 [`rendering/`](../rendering/README.md)，资源�
 - [`runtime/`](runtime/README.md)：有界异步加载、共享引用、取消、超时和缓存。
 - [`cooked/`](cooked/README.md)：`.mnec` 静态几何读写与 FBX 转换。
 
-初始化通过同一 worker 预加载，新模型经非阻塞 `poll` 进入缓存。尚无资源数据库、纹理、动画、虚拟资源路径、持久导入缓存、依赖图、热重载或完整资源包；cooked 文件仍是逐个读取。
+初始化通过同一 worker 预加载，新模型经非阻塞 `poll` 进入缓存。虚拟资源路径（`res://`，见 [`runtime/`](runtime/README.md)）与 opt-in 热重载已实现；尚无资源数据库、纹理、动画、持久导入缓存、依赖图或完整资源包，cooked 文件仍是逐个读取。
 
 初始化通过同一 worker 预加载，运行中新增模型由 `poll` 非阻塞接收。当前没有资源数据库、纹理、动画、虚拟资源路径、持久导入缓存、依赖图或完整资源包；cooked 文件仍需逐个读取。

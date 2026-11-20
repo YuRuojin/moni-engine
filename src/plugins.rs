@@ -85,17 +85,24 @@ pub struct RenderPlugin {
     renderer: Option<GpuRenderer>,
     collect_gpu_timestamps: bool,
     load_fbx_assets: bool,
+    hot_reload: bool,
 }
 
 impl RenderPlugin {
     pub const ID: &'static str = "core.render";
 
-    pub fn new(window: Arc<Window>, collect_gpu_timestamps: bool, load_fbx_assets: bool) -> Self {
+    pub fn new(
+        window: Arc<Window>,
+        collect_gpu_timestamps: bool,
+        load_fbx_assets: bool,
+        hot_reload: bool,
+    ) -> Self {
         Self {
             window,
             renderer: None,
             collect_gpu_timestamps,
             load_fbx_assets,
+            hot_reload,
         }
     }
 
@@ -192,6 +199,7 @@ impl Plugin for RenderPlugin {
                 context.engine.world(),
                 self.collect_gpu_timestamps,
                 self.load_fbx_assets,
+                self.hot_reload,
             )
             .map_err(|error| PluginError::new(format!("{error:#}")))?,
         );

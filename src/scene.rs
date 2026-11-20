@@ -52,12 +52,14 @@ pub fn load_scene(path: &Path) -> anyhow::Result<World> {
     }
 
     let registry = ComponentRegistry::new();
+    let asset_aliases = parse_asset_aliases(&scene.extensions)?;
     let mut world = World {
         version: SNAPSHOT_VERSION,
         viewport: scene.viewport,
         camera: scene.camera,
         lights: scene.lights,
         extensions: scene.extensions,
+        asset_aliases,
         ..World::default()
     };
     let mut entities = BTreeMap::new();
@@ -156,6 +158,13 @@ pub fn scene_value(world: &World, name: &str) -> anyhow::Result<Value> {
         bail!("scene name must not be empty");
     }
     let registry = ComponentRegistry::new();
+    let mut extensions = world.extensions.clone();
+    if !world.asset_aliases.is_empty() {
+        extensions.insert(
+            "res".to_string(),
+            serde_json::to_value(&world.asset_aliases)?,
+        );
+    }
     let mut entities = Vec::new();
     for entity in world.entities.values() {
         let mut components = entity.extensions.clone();
@@ -214,7 +223,7 @@ pub fn scene_value(world: &World, name: &str) -> anyhow::Result<Value> {
         viewport: world.viewport.clone(),
         camera: world.camera.clone(),
         lights: world.lights.clone(),
-        extensions: world.extensions.clone(),
+        extensions,
         entities,
     })?)
 }
@@ -316,6 +325,53 @@ pub fn migrate_snapshot(mut value: Value) -> anyhow::Result<Value> {
     Ok(value)
 }
 
+fn parse_asset_aliases(
+    extensions: &BTreeMap<String, Value>,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let Some(value) = extensions.get("res") else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(map) = value.as_object() else {
+        bail!("scene extensions.res must be an object of alias -> workspace-relative path");
+    };
+    let mut aliases = BTreeMap::new();
+    for (alias, target) in map {
+        if !is_valid_alias(alias) {
+            bail!(
+                "scene extensions.res alias '{alias}' is invalid; use 1-64 letters, digits, '-', '_', or '.' without '..'"
+            );
+        }
+        let Some(target) = target.as_str() else {
+            bail!("scene extensions.res alias '{alias}' must map to a string path");
+        };
+        let target_path = std::path::Path::new(target);
+        if target.is_empty()
+            || target_path.is_absolute()
+            || target_path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::Prefix(_)
+                        | std::path::Component::RootDir
+                        | std::path::Component::ParentDir
+                )
+            })
+        {
+            bail!("scene extensions.res alias '{alias}' must map to a workspace-relative path");
+        }
+        aliases.insert(alias.to_string(), target.to_string());
+    }
+    Ok(aliases)
+}
+
+fn is_valid_alias(alias: &str) -> bool {
+    !alias.is_empty()
+        && alias.len() <= 64
+        && !alias.contains("..")
+        && alias.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+}
+
 fn load_script(component: ScriptComponent) -> anyhow::Result<ScriptState> {
     if let Some(raw_path) = &component.source {
         let path = crate::workspace_path(raw_path)?;
@@ -340,5 +396,58 @@ fn load_script(component: ScriptComponent) -> anyhow::Result<ScriptState> {
             enabled: true,
             last_error: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn load_reads_scene_asset_aliases() {
+        let world = load_scene(std::path::Path::new("testing/assets/benchmark-3d.mnsc"))
+            .expect("benchmark scene loads");
+        assert_eq!(
+            world.asset_aliases.get("terrain").map(String::as_str),
+            Some("testing/assets/benchmark.mnec")
+        );
+    }
+
+    #[test]
+    fn scene_save_roundtrips_asset_aliases() {
+        let mut world = World::default();
+        world
+            .asset_aliases
+            .insert("hero".to_string(), "assets/hero.mnec".to_string());
+        let path = std::env::temp_dir().join(format!("moni-aliases-{}.mnsc", std::process::id()));
+        save_scene(&world, "aliases", &path).expect("save scene");
+        let value: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read saved scene"))
+                .expect("parse saved scene");
+        assert_eq!(
+            value["extensions"]["res"]["hero"],
+            json!("assets/hero.mnec")
+        );
+        let loaded = load_scene(&path).expect("reload scene");
+        assert_eq!(
+            loaded.asset_aliases.get("hero").map(String::as_str),
+            Some("assets/hero.mnec")
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn invalid_alias_tables_are_rejected() {
+        let mut world = World::default();
+        world
+            .extensions
+            .insert("res".to_string(), json!({ "bad path": "assets/hero.mnec" }));
+        let path =
+            std::env::temp_dir().join(format!("moni-aliases-bad-{}.mnsc", std::process::id()));
+        save_scene(&world, "aliases", &path).expect("save scene");
+        let error = load_scene(&path).expect_err("invalid alias table must fail");
+        assert!(error.to_string().contains("invalid"));
+        fs::remove_file(&path).ok();
     }
 }
