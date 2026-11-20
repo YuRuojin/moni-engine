@@ -13,8 +13,14 @@ const MAX_COOKED_VERTICES: usize = 10_000_000;
 pub fn read_cooked_mesh(path: &Path) -> anyhow::Result<FbxMesh> {
     let bytes =
         fs::read(path).with_context(|| format!("could not read cooked mesh {}", path.display()))?;
+    decode_cooked_mesh(&bytes).with_context(|| format!("in {}", path.display()))
+}
+
+/// Parses cooked bytes; the fuzzer exercises this directly so header/vertex
+/// corruption can never panic or desynchronize the claimed vertex count.
+pub fn decode_cooked_mesh(bytes: &[u8]) -> anyhow::Result<FbxMesh> {
     if bytes.len() < HEADER_BYTES || &bytes[..8] != MAGIC {
-        bail!("invalid cooked mesh magic in {}", path.display());
+        bail!("invalid cooked mesh magic");
     }
     let count = u64::from_le_bytes(bytes[8..16].try_into()?) as usize;
     if count > MAX_COOKED_VERTICES {
@@ -23,8 +29,7 @@ pub fn read_cooked_mesh(path: &Path) -> anyhow::Result<FbxMesh> {
     let expected = HEADER_BYTES + count * VERTEX_BYTES;
     if bytes.len() != expected {
         bail!(
-            "cooked mesh size mismatch in {}: expected {expected}, got {}",
-            path.display(),
+            "cooked mesh size mismatch: expected {expected}, got {}",
             bytes.len()
         );
     }
@@ -50,7 +55,9 @@ pub fn read_cooked_mesh(path: &Path) -> anyhow::Result<FbxMesh> {
     Ok(FbxMesh { vertices })
 }
 
-pub fn write_cooked_mesh(path: &Path, mesh: &FbxMesh) -> anyhow::Result<()> {
+/// Serializes cooked bytes without touching the filesystem so tools and the
+/// fuzzer can build packages in memory.
+pub fn encode_cooked_mesh(mesh: &FbxMesh) -> anyhow::Result<Vec<u8>> {
     if mesh.vertices.len() > MAX_COOKED_VERTICES {
         bail!("mesh vertex count exceeds {MAX_COOKED_VERTICES}");
     }
@@ -78,6 +85,11 @@ pub fn write_cooked_mesh(path: &Path, mesh: &FbxMesh) -> anyhow::Result<()> {
         }
         bytes.extend_from_slice(&u32::from(vertex.color.is_some()).to_le_bytes());
     }
+    Ok(bytes)
+}
+
+pub fn write_cooked_mesh(path: &Path, mesh: &FbxMesh) -> anyhow::Result<()> {
+    let bytes = encode_cooked_mesh(mesh)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

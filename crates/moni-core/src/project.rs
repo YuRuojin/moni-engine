@@ -66,6 +66,10 @@ impl GameProject {
             );
         }
         validate_relative_path(&self.scene, "scene")?;
+        for (id, dependency) in &self.dependencies {
+            crate::profile::validate_version_requirement(&dependency.version)
+                .with_context(|| format!("dependency '{id}' has an invalid version requirement"))?;
+        }
         Profile::named(&self.profile)?;
         Ok(())
     }
@@ -75,6 +79,30 @@ impl GameProject {
         profile.plugins = self.plugins.clone();
         profile.patches = self.patches.clone();
         Ok(profile)
+    }
+
+    /// Validates declared direct dependency version constraints against the
+    /// resolved effective profile manifest versions.
+    pub fn check_direct_dependencies(
+        &self,
+        effective: &crate::profile::EffectiveProfile,
+    ) -> anyhow::Result<()> {
+        for (id, dependency) in &self.dependencies {
+            let Some(manifest) = effective.manifests().find(|m| m.id == *id) else {
+                bail!(
+                    "project depends on plugin '{id}' version '{}' but it is not in the effective profile",
+                    dependency.version
+                );
+            };
+            if !crate::profile::version_matches(&dependency.version, &manifest.version)? {
+                bail!(
+                    "project depends on plugin '{id}' version {} but the profile resolves '{}'",
+                    dependency.version,
+                    manifest.version
+                );
+            }
+        }
+        Ok(())
     }
 
     pub fn scene_path(&self, root: &Path) -> anyhow::Result<PathBuf> {
@@ -336,5 +364,56 @@ mod tests {
         assert!(project.validate().is_err());
         project.scene = "scenes/main.mnsc".to_string();
         project.validate().expect("relative scene passes");
+    }
+
+    #[test]
+    fn direct_dependency_constraints_are_checked_against_the_profile() {
+        let effective = sample_project()
+            .profile()
+            .expect("default profile")
+            .resolve(&crate::profile::Target::current())
+            .expect("resolve default");
+
+        let mut project = sample_project();
+        project.dependencies.insert(
+            "core.render".to_string(),
+            ProjectDependency {
+                version: ">=0.1.0".to_string(),
+            },
+        );
+        project
+            .check_direct_dependencies(&effective)
+            .expect("satisfied constraint");
+
+        project.dependencies.insert(
+            "core.render".to_string(),
+            ProjectDependency {
+                version: "^9.0.0".to_string(),
+            },
+        );
+        let error = project
+            .check_direct_dependencies(&effective)
+            .expect_err("unsatisfiable constraint must fail");
+        assert!(error.to_string().contains("resolves"));
+
+        project.dependencies.insert(
+            "core.editor".to_string(),
+            ProjectDependency {
+                version: "*".to_string(),
+            },
+        );
+        let error = project
+            .check_direct_dependencies(&effective)
+            .expect_err("plugin outside the effective tree must fail");
+        assert!(error.to_string().contains("not in the effective profile"));
+
+        project.dependencies.clear();
+        project.dependencies.insert(
+            "core.render".to_string(),
+            ProjectDependency {
+                version: "banana".to_string(),
+            },
+        );
+        assert!(project.validate().is_err());
     }
 }

@@ -2,7 +2,7 @@
 
 [中文](README.md) | English
 
-`plugins/` is the taxonomy for officially maintained capabilities. Static manifests, execution domains, and dependency resolution are implemented in `src/profile.rs`; **a dynamic loader, stable ABI, external manifest loading, and automatic discovery are not implemented**. Create a concrete plugin directory only for a real implementation, not an empty placeholder.
+`plugins/` is the taxonomy for officially maintained capabilities. Each official plugin is its own workspace crate depending only on the host contracts in `crates/moni-core`; static manifests, execution domains, and dependency resolution live in `crates/moni-core/src/profile.rs`, and the composition root (the root binary under `src/`) is the only place that constructs concrete plugin instances. **A dynamic loader, stable ABI, external manifest loading, and automatic discovery are not implemented**. Create a concrete plugin directory only for a real implementation, not an empty placeholder.
 
 ## Categories
 

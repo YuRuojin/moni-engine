@@ -1,0 +1,12 @@
+[package]
+name = "moni-assets"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+anyhow = "1"
+moni-core = { path = "../../crates/moni-core" }
+ufbx = "0.11.5"

@@ -1,85 +1,21 @@
+//! The core.render plugin: wraps the wgpu renderer behind the host's plugin
+//! and render-API traits so clients and editors never name this type.
+
 use std::any::Any;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
+use serde_json::Value;
 use winit::window::Window;
 
-use crate::gpu::{GpuRenderer, OverlayQuad};
-use crate::host::{
-    Access, Plugin, PluginContext, PluginError, PluginOutput, Resource, SystemDescriptor,
-    SystemStage, ThreadAffinity,
+use crate::GpuRenderer;
+use moni_core::host::{
+    Access, CORE_RENDER, OverlayQuad, Plugin, PluginContext, PluginError, PluginOutput,
+    RenderPluginApi, Resource, SystemDescriptor, SystemStage, ThreadAffinity,
 };
 
-pub struct SimulationPlugin;
-
-impl SimulationPlugin {
-    pub const ID: &'static str = "core.simulation";
-}
-
-impl Plugin for SimulationPlugin {
-    fn id(&self) -> &'static str {
-        Self::ID
-    }
-
-    fn systems(&self) -> Vec<SystemDescriptor> {
-        vec![
-            SystemDescriptor {
-                id: "core.simulation.fixed_update",
-                plugin_id: Self::ID,
-                stage: SystemStage::FixedUpdate,
-                affinity: ThreadAffinity::Logic,
-                after: vec![],
-                access: vec![
-                    Access::write(Resource::World),
-                    Access::write(Resource::Scripts),
-                ],
-            },
-            SystemDescriptor {
-                id: "core.simulation.shutdown",
-                plugin_id: Self::ID,
-                stage: SystemStage::Shutdown,
-                affinity: ThreadAffinity::Logic,
-                after: vec![],
-                access: vec![Access::write(Resource::Scripts)],
-            },
-        ]
-    }
-
-    fn start(&mut self, context: &mut PluginContext) -> Result<(), PluginError> {
-        context.require("script.execute")
-    }
-
-    fn stop(&mut self, context: &mut PluginContext) {
-        context.engine.shutdown_runtime();
-    }
-
-    fn execute(
-        &mut self,
-        stage: SystemStage,
-        context: &mut PluginContext,
-    ) -> Result<PluginOutput, PluginError> {
-        match stage {
-            SystemStage::FixedUpdate => {
-                context.require("script.execute")?;
-                context
-                    .engine
-                    .step(1)
-                    .map_err(|error| PluginError::new(error.message))?;
-                Ok(PluginOutput::None)
-            }
-            SystemStage::Shutdown => {
-                context.engine.shutdown_runtime();
-                Ok(PluginOutput::None)
-            }
-            _ => Ok(PluginOutput::None),
-        }
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-}
-
+/// The `core.render` plugin instance.
 pub struct RenderPlugin {
     window: Arc<Window>,
     renderer: Option<GpuRenderer>,
@@ -89,7 +25,7 @@ pub struct RenderPlugin {
 }
 
 impl RenderPlugin {
-    pub const ID: &'static str = "core.render";
+    pub const ID: &'static str = CORE_RENDER;
 
     pub fn new(
         window: Arc<Window>,
@@ -105,41 +41,41 @@ impl RenderPlugin {
             hot_reload,
         }
     }
+}
 
-    pub fn last_preparation_time(&self) -> std::time::Duration {
+impl RenderPluginApi for RenderPlugin {
+    fn last_preparation_time(&self) -> Duration {
         self.renderer
             .as_ref()
-            .map_or(std::time::Duration::ZERO, |renderer| {
-                renderer.last_preparation_time()
-            })
+            .map_or(Duration::ZERO, GpuRenderer::last_preparation_time)
     }
 
-    pub fn loaded_mesh_vertices(&self) -> usize {
+    fn loaded_mesh_vertices(&self) -> usize {
         self.renderer
             .as_ref()
             .map_or(0, GpuRenderer::loaded_mesh_vertices)
     }
 
-    pub fn gpu_timestamps_supported(&self) -> bool {
+    fn gpu_timestamps_supported(&self) -> bool {
         self.renderer
             .as_ref()
             .is_some_and(GpuRenderer::gpu_timestamps_supported)
     }
 
-    pub fn take_gpu_samples(&mut self) -> Vec<(f32, f32)> {
+    fn take_gpu_samples(&mut self) -> Vec<(f32, f32)> {
         self.renderer
             .as_mut()
             .map(|renderer| renderer.take_gpu_samples())
             .unwrap_or_default()
     }
 
-    pub fn set_overlay_quads(&mut self, quads: Vec<OverlayQuad>) {
+    fn set_overlay_quads(&mut self, quads: Vec<OverlayQuad>) {
         if let Some(renderer) = &mut self.renderer {
             renderer.set_overlay_quads(quads);
         }
     }
 
-    pub fn capture_next(&mut self, path: PathBuf) {
+    fn capture_next(&mut self, path: PathBuf) {
         if let Some(renderer) = &mut self.renderer {
             renderer.capture_next(path);
         }
@@ -188,10 +124,32 @@ impl Plugin for RenderPlugin {
         ]
     }
 
+    fn configure(&mut self, config: &Value) -> Result<(), PluginError> {
+        let Some(object) = config.as_object() else {
+            return Err(PluginError::new("core.render config must be an object"));
+        };
+        for (key, value) in object {
+            match key.as_str() {
+                "hotReload" => {
+                    let enabled = value.as_bool().ok_or_else(|| {
+                        PluginError::new("core.render config 'hotReload' must be a boolean")
+                    })?;
+                    self.hot_reload = enabled;
+                }
+                other => {
+                    return Err(PluginError::new(format!(
+                        "core.render config has unknown field '{other}'"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn start(&mut self, context: &mut PluginContext) -> Result<(), PluginError> {
         context.require("gpu.create")?;
         if self.load_fbx_assets {
-            context.require_from("core.fbx", "asset.read.workspace")?;
+            context.require_from(moni_core::host::CORE_FBX, "asset.read.workspace")?;
         }
         self.renderer = Some(
             GpuRenderer::new(
@@ -219,7 +177,7 @@ impl Plugin for RenderPlugin {
             SystemStage::Render => {
                 context.require("gpu.create")?;
                 if self.load_fbx_assets {
-                    context.require_from("core.fbx", "asset.read.workspace")?;
+                    context.require_from(moni_core::host::CORE_FBX, "asset.read.workspace")?;
                 }
                 let status = self
                     .renderer
@@ -241,6 +199,10 @@ impl Plugin for RenderPlugin {
         if let Some(renderer) = &mut self.renderer {
             renderer.resize(width, height);
         }
+    }
+
+    fn as_render_api(&mut self) -> Option<&mut dyn RenderPluginApi> {
+        Some(self)
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {

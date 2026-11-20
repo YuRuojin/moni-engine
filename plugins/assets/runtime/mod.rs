@@ -136,7 +136,7 @@ impl AssetRuntime {
             return Ok(());
         }
         let physical = self.resolve_physical(path)?;
-        let absolute = crate::workspace_path(&physical)?;
+        let absolute = moni_core::workspace_path(&physical)?;
         let kind = asset_kind(&physical)?;
         let id = self.next_id;
         self.next_id = self
@@ -261,7 +261,7 @@ impl AssetRuntime {
             let Ok(physical) = self.resolve_physical(path) else {
                 continue;
             };
-            let Ok(absolute) = crate::workspace_path(&physical) else {
+            let Ok(absolute) = moni_core::workspace_path(&physical) else {
                 continue;
             };
             let Ok(current) = fingerprint(&absolute) else {

@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::scene3d::{Camera3d, Light, Model3d, Transform3d, Vector3};
-use crate::script::{HookOutput, ScriptFailure, ScriptHost};
 
 pub const SNAPSHOT_VERSION: u32 = 2;
 pub const DEFAULT_TICK_RATE: u32 = 60;
@@ -507,11 +506,30 @@ pub enum Command {
     },
 }
 
+/// Result of one script-runtime pass: already-structured core events plus
+/// parsed commands for the engine to apply.
+#[derive(Debug, Default)]
+pub struct ScriptTickOutput {
+    pub events: Vec<Event>,
+    pub commands: Vec<(EntityId, Command)>,
+}
+
+/// Script execution lives behind this trait so the core engine never names a
+/// scripting implementation. The runtime reconciles its per-entity state
+/// against the world every tick: it spawns hosts for new or changed scripts,
+/// drops hosts for despawned entities, and disables scripts that fail. The
+/// composition root installs exactly one implementation.
+pub trait ScriptRuntime: std::fmt::Debug {
+    fn tick(&mut self, world: &mut World, tick: u64, dt: f64) -> ScriptTickOutput;
+    fn host_count(&self) -> usize;
+    fn clear(&mut self);
+}
+
 #[derive(Debug, Default)]
 pub struct Engine {
     world: World,
     events: Vec<Event>,
-    script_hosts: BTreeMap<EntityId, ScriptHost>,
+    script_runtime: Option<Box<dyn ScriptRuntime>>,
 }
 
 impl Engine {
@@ -531,24 +549,38 @@ impl Engine {
         std::mem::take(&mut self.events)
     }
 
+    /// Installs the scripting implementation. Without a runtime, script
+    /// components remain inert data and never execute.
+    pub fn set_script_runtime(&mut self, runtime: Box<dyn ScriptRuntime>) {
+        self.script_runtime = Some(runtime);
+    }
+
     pub fn script_host_count(&self) -> usize {
-        self.script_hosts.len()
+        self.script_runtime
+            .as_ref()
+            .map_or(0, |runtime| runtime.host_count())
     }
 
     pub fn shutdown_runtime(&mut self) {
-        self.script_hosts.clear();
+        if let Some(runtime) = &mut self.script_runtime {
+            runtime.clear();
+        }
     }
 
     pub fn reset(&mut self) {
         self.world = World::default();
-        self.script_hosts.clear();
+        if let Some(runtime) = &mut self.script_runtime {
+            runtime.clear();
+        }
         self.events.push(Event::WorldReset);
     }
 
     pub fn load_world(&mut self, world: World) -> Result<(), EngineError> {
         world.validate()?;
         self.world = world;
-        self.script_hosts.clear();
+        if let Some(runtime) = &mut self.script_runtime {
+            runtime.clear();
+        }
         self.events.push(Event::WorldLoaded);
         Ok(())
     }
@@ -580,7 +612,6 @@ impl Engine {
                 if self.world.entities.remove(&entity).is_none() {
                     return Err(entity_not_found(entity));
                 }
-                self.script_hosts.remove(&entity);
                 self.events.push(Event::EntityDespawned { entity });
                 Ok(json!({ "entity": entity }))
             }
@@ -637,7 +668,8 @@ impl Engine {
                     enabled: true,
                     last_error: None,
                 });
-                self.script_hosts.remove(&entity);
+                // The script runtime notices the changed source on its next
+                // tick and rebuilds the host for this entity.
                 self.events.push(Event::ScriptAttached { entity });
                 Ok(json!({ "entity": entity }))
             }
@@ -684,36 +716,11 @@ impl Engine {
     fn step_once(&mut self) {
         let dt = 1.0 / f64::from(self.world.tick_rate);
         let tick = self.world.tick;
-        let runnable: Vec<Entity> = self
-            .world
-            .entities
-            .values()
-            .filter(|entity| entity.script.as_ref().is_some_and(|script| script.enabled))
-            .cloned()
-            .collect();
-
         let mut pending_commands = Vec::new();
-        for entity in runnable {
-            let Some(script) = entity.script.as_ref() else {
-                continue;
-            };
-            match self.run_script(&entity, &script.source, tick, dt) {
-                Ok(output) => self.collect_script_output(entity.id, output, &mut pending_commands),
-                Err(error) => {
-                    if let Some(current) = self.world.entities.get_mut(&entity.id)
-                        && let Some(script) = current.script.as_mut()
-                    {
-                        script.enabled = false;
-                        script.last_error = Some(error.message.clone());
-                    }
-                    self.script_hosts.remove(&entity.id);
-                    self.events.push(Event::ScriptError {
-                        entity: entity.id,
-                        code: error.code,
-                        message: error.message,
-                    });
-                }
-            }
+        if let Some(runtime) = &mut self.script_runtime {
+            let output = runtime.tick(&mut self.world, tick, dt);
+            self.events.extend(output.events);
+            pending_commands = output.commands;
         }
 
         for (origin, command) in pending_commands {
@@ -726,46 +733,6 @@ impl Engine {
             }
         }
         self.world.tick += 1;
-    }
-
-    fn run_script(
-        &mut self,
-        entity: &Entity,
-        source: &str,
-        tick: u64,
-        dt: f64,
-    ) -> Result<HookOutput, ScriptFailure> {
-        if let std::collections::btree_map::Entry::Vacant(entry) =
-            self.script_hosts.entry(entity.id)
-        {
-            entry.insert(ScriptHost::new(source)?);
-        }
-        let host = self
-            .script_hosts
-            .get_mut(&entity.id)
-            .expect("script host was inserted");
-        host.assert_logic_thread();
-        host.run_tick(entity, tick, dt)
-    }
-
-    fn collect_script_output(
-        &mut self,
-        entity: EntityId,
-        output: HookOutput,
-        pending_commands: &mut Vec<(EntityId, Command)>,
-    ) {
-        for message in output.logs {
-            self.events.push(Event::ScriptLog { entity, message });
-        }
-        for raw in output.commands {
-            match serde_json::from_str::<Command>(&raw) {
-                Ok(command) => pending_commands.push((entity, command)),
-                Err(error) => self.events.push(Event::InvalidScriptCommand {
-                    entity,
-                    message: error.to_string(),
-                }),
-            }
-        }
     }
 
     fn entity_mut(&mut self, entity: EntityId) -> Result<&mut Entity, EngineError> {

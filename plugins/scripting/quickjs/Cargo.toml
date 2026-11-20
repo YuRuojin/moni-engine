@@ -1,0 +1,12 @@
+[package]
+name = "moni-script"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "mod.rs"
+
+[dependencies]
+moni-core = { path = "../../../crates/moni-core" }
+rquickjs = "0.14"
+serde_json = "1"

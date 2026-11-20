@@ -2,10 +2,50 @@ use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::engine::{Engine, Event, World};
 
 pub const MAX_SYSTEM_TASKS: usize = 1_024;
+
+/// Well-known plugin IDs. Core and the composition root share these string
+/// contracts without sharing concrete types.
+pub const CORE_SIMULATION: &str = "core.simulation";
+pub const CORE_RENDER: &str = "core.render";
+pub const CORE_FBX: &str = "core.fbx";
+pub const CORE_EDITOR: &str = "core.editor";
+
+/// Outcome of a render pass, reported back to the host without exposing any
+/// renderer type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderStatus {
+    Rendered,
+    Reconfigure,
+    Skip,
+}
+
+/// Screen-space quad rendered above the scene by the render plugin. Core
+/// owns the data so editors can compose overlays without naming a renderer.
+#[derive(Debug, Clone, Copy)]
+pub struct OverlayQuad {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub color: [f32; 4],
+}
+
+/// Renderer capabilities the host and tools consume through the plugin trait,
+/// so clients and editors never downcast to a concrete renderer type.
+pub trait RenderPluginApi {
+    fn last_preparation_time(&self) -> Duration;
+    fn loaded_mesh_vertices(&self) -> usize;
+    fn gpu_timestamps_supported(&self) -> bool;
+    fn take_gpu_samples(&mut self) -> Vec<(f32, f32)>;
+    fn set_overlay_quads(&mut self, quads: Vec<OverlayQuad>);
+    fn capture_next(&mut self, path: PathBuf);
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SystemStage {
@@ -91,7 +131,7 @@ impl Error for PluginError {}
 #[derive(Debug, Clone, Copy)]
 pub enum PluginOutput {
     None,
-    Render(crate::gpu::RenderStatus),
+    Render(RenderStatus),
 }
 
 #[derive(Default)]
@@ -150,7 +190,21 @@ pub trait Plugin: Any {
         stage: SystemStage,
         context: &mut PluginContext,
     ) -> Result<PluginOutput, PluginError>;
+    /// Applies configuration merged from ordered profile patches before
+    /// `start`. Plugins without configuration support reject every input so
+    /// a misdirected patch fails loudly.
+    fn configure(&mut self, _config: &serde_json::Value) -> Result<(), PluginError> {
+        Err(PluginError::new(format!(
+            "plugin '{}' does not accept configuration",
+            self.id()
+        )))
+    }
     fn resize(&mut self, _width: u32, _height: u32) {}
+    /// Render plugins expose their tool surface here; everything else returns
+    /// `None` so callers never downcast to concrete plugin types.
+    fn as_render_api(&mut self) -> Option<&mut dyn RenderPluginApi> {
+        None
+    }
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
@@ -176,7 +230,7 @@ pub struct PluginHost {
     systems: Vec<SystemDescriptor>,
     queue: VecDeque<SystemDescriptor>,
     permissions: PermissionPolicy,
-    last_render_status: Option<crate::gpu::RenderStatus>,
+    last_render_status: Option<RenderStatus>,
     shutdown: bool,
 }
 
@@ -321,12 +375,18 @@ impl PluginHost {
         self.plugins.contains_key(id)
     }
 
-    pub fn last_render_status(&self) -> Option<crate::gpu::RenderStatus> {
+    pub fn last_render_status(&self) -> Option<RenderStatus> {
         self.last_render_status
     }
 
     pub fn plugin_mut<T: Any>(&mut self, id: &'static str) -> Option<&mut T> {
         self.plugins.get_mut(id)?.as_any_mut().downcast_mut::<T>()
+    }
+
+    /// Renderer tool surface for the plugin with the given ID, without
+    /// exposing the concrete plugin type to callers.
+    pub fn render_api_mut(&mut self, id: &str) -> Option<&mut dyn RenderPluginApi> {
+        self.plugins.get_mut(id)?.as_render_api()
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -375,10 +435,11 @@ mod tests {
     fn duplicate_plugin_registration_is_rejected() {
         let mut host = PluginHost::new(Engine::new());
         let permissions = ["script.execute".to_string()];
-        let first = host.register_plugin_with_permissions(Box::new(SimulationPlugin), &permissions);
+        let first =
+            host.register_plugin_with_permissions(Box::new(SimulationPlugin::new()), &permissions);
         assert!(first.is_ok());
         let second =
-            host.register_plugin_with_permissions(Box::new(SimulationPlugin), &permissions);
+            host.register_plugin_with_permissions(Box::new(SimulationPlugin::new()), &permissions);
         assert!(second.is_err(), "duplicate plugin ID must be rejected");
         let mut handles = vec![first.expect("first registration")];
         while let Some(handle) = handles.pop() {

@@ -1,17 +1,32 @@
+[workspace]
+members = [
+    "crates/moni-core",
+    "plugins/assets",
+    "plugins/editor/scene-viewer",
+    "plugins/rendering/wgpu",
+    "plugins/scripting/quickjs",
+]
+resolver = "2"
+
 [package]
 name = "moni-engine"
 version = "0.1.0"
 edition = "2024"
 description = "An agent-controllable 2D and 3D game engine with Rust and TypeScript"
 
+# The root package is the composition root: its binary is the only place that
+# names concrete plugin types or wires implementations into core traits.
+[[bin]]
+name = "moni-engine"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1"
-bytemuck = { version = "1", features = ["derive"] }
-pollster = "1"
-rquickjs = "0.14"
+moni-assets = { path = "plugins/assets" }
+moni-core = { path = "crates/moni-core" }
+moni-editor = { path = "plugins/editor/scene-viewer" }
+moni-render = { path = "plugins/rendering/wgpu" }
+moni-script = { path = "plugins/scripting/quickjs" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.11"
-ufbx = "0.11.5"
-wgpu = "30"
 winit = "0.30"

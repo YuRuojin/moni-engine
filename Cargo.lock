@@ -823,19 +823,70 @@ dependencies = [
 ]
 
 [[package]]
+name = "moni-assets"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "moni-core",
+ "ufbx",
+]
+
+[[package]]
+name = "moni-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "moni-editor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "moni-core",
+ "serde_json",
+ "winit",
+]
+
+[[package]]
 name = "moni-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bytemuck",
- "pollster",
- "rquickjs",
+ "moni-assets",
+ "moni-core",
+ "moni-editor",
+ "moni-render",
+ "moni-script",
  "serde",
  "serde_json",
- "sha2",
- "ufbx",
+ "winit",
+]
+
+[[package]]
+name = "moni-render"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "moni-assets",
+ "moni-core",
+ "pollster",
+ "serde_json",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "moni-script"
+version = "0.1.0"
+dependencies = [
+ "moni-core",
+ "rquickjs",
+ "serde_json",
 ]
 
 [[package]]

@@ -28,12 +28,24 @@ Module domains are `runtime`, `editor`, `build`, `developer`, and `test`. Module
 The resolver:
 
 1. Expands ordered bundles and explicit plugin declarations.
-2. Applies ordered enable/disable patches and rejects unknown targets.
-3. Recursively includes required dependencies; optional dependencies are included only when explicitly requested.
-4. Reports missing dependencies, disabled required dependencies, and dependency cycles with concrete paths.
+2. Applies ordered enable/disable patches, merges plugin configuration, and rejects unknown targets.
+3. Recursively includes required dependencies; optional dependencies are included only when explicitly requested, and dependency version constraints are verified.
+4. Reports missing dependencies, disabled required dependencies, dependency cycles, and unsatisfied version constraints with concrete paths.
 5. Applies target filtering and conflict checks after topological sorting.
 
-A required dependency disabled by a patch is an error rather than a silent skip.
+A required dependency disabled by a patch is an error rather than a silent skip. Version requirements support `*` (any), `X.Y.Z` (exact), `^X.Y.Z` (semver caret: same major; for `0.x`, same minor), and comma-separated `>=`/`<=`/`>`/`<`/`=` comparators; an unparseable requirement rejects every version (fail closed).
+
+## Ordered patches and plugin configuration
+
+Patches apply in declaration order. Besides the `enabled` switch, a patch may carry a `config` object handed to the plugin's `configure` before instantiation; later patches override keys set by earlier ones. Config on a disabled plugin or on capability-only plugins (`core.fbx`/`core.editor`) is an explicit error. Project `game.mngp` patch arrays and the CLI `--plugin-config ID=JSON` flow through the same ordered merge, and the merged configuration is exported with the effective tree.
+
+```json
+{
+  "plugin": "core.simulation",
+  "enabled": true,
+  "config": { "tickRate": 250 }
+}
+```
 
 ## Current bundles
 

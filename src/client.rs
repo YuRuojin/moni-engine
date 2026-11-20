@@ -11,11 +11,12 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::benchmark::{BenchmarkReport, write_report};
-use crate::engine::Engine;
-use crate::gpu::RenderStatus;
-use crate::host::{PluginHandle, PluginHost, SystemStage};
-use crate::plugins::{RenderPlugin, SimulationPlugin};
-use crate::profile::Profile;
+use crate::bootstrap;
+use moni_core::engine::Engine;
+use moni_core::host::{CORE_RENDER, PluginHandle, PluginHost, RenderStatus, SystemStage};
+use moni_core::plugins::SimulationPlugin;
+use moni_core::profile::Profile;
+use moni_script::QuickJsScriptRuntime;
 
 pub fn run(args: Vec<String>) -> anyhow::Result<()> {
     run_internal(args, None)
@@ -132,19 +133,19 @@ fn run_internal(args: Vec<String>, profile_override: Option<Profile>) -> anyhow:
     if world_path.is_some() {
         scene = "world";
     }
-    let engine = if let Some(world_path) = world_path {
+    let mut engine = if let Some(world_path) = world_path {
         let path = if Path::new(&world_path).is_absolute() {
             PathBuf::from(&world_path)
         } else {
-            crate::workspace_path(&world_path)?
+            moni_core::workspace_path(&world_path)?
         };
-        let world = crate::scene::load_scene(&path)?;
+        let world = moni_core::scene::load_scene(&path)?;
         let mut engine = Engine::new();
         engine.load_world(world)?;
         engine
     } else {
         let script = script.unwrap_or_else(|| "examples/dist/model-orbit.js".to_string());
-        let script_path = crate::workspace_path(&script)?;
+        let script_path = moni_core::workspace_path(&script)?;
         let source = std::fs::read_to_string(&script_path).with_context(|| {
             format!(
                 "could not read {}; run 'npm install && npm run build' first",
@@ -157,6 +158,7 @@ fn run_internal(args: Vec<String>, profile_override: Option<Profile>) -> anyhow:
             crate::demo_engine(source)?
         }
     };
+    engine.set_script_runtime(Box::new(QuickJsScriptRuntime::new()));
     let event_loop = EventLoop::new().context("could not create the window event loop")?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut profile = match profile_override {
@@ -211,12 +213,12 @@ fn run_internal(args: Vec<String>, profile_override: Option<Profile>) -> anyhow:
             std::mem::take(&mut app.preparation_samples),
         )?;
         write_report(&preparation_report, &preparation_output)?;
-        let render_plugin = app
+        let render = app
             .host
-            .plugin_mut::<RenderPlugin>(RenderPlugin::ID)
+            .render_api_mut(CORE_RENDER)
             .expect("render plugin is registered");
-        let gpu_samples = render_plugin.take_gpu_samples();
-        let gpu_supported = render_plugin.gpu_timestamps_supported();
+        let gpu_samples = render.take_gpu_samples();
+        let gpu_supported = render.gpu_timestamps_supported();
         let gpu_result = if gpu_supported {
             let parent = Path::new(&output).parent().unwrap_or_else(|| Path::new(""));
             let shadow_path = parent
@@ -273,8 +275,8 @@ fn run_internal(args: Vec<String>, profile_override: Option<Profile>) -> anyhow:
     }
     let loaded_mesh_vertices = app
         .host
-        .plugin_mut::<RenderPlugin>(RenderPlugin::ID)
-        .map_or(0, |plugin| plugin.loaded_mesh_vertices());
+        .render_api_mut(CORE_RENDER)
+        .map_or(0, |render| render.loaded_mesh_vertices());
     let simulation_plugin = app.simulation_handle.as_ref().map(PluginHandle::id);
     if let Some(handle) = app.simulation_handle.take() {
         handle.dispose(&mut app.host)?;
@@ -323,11 +325,11 @@ impl ClientApp {
         hot_reload: bool,
     ) -> anyhow::Result<Self> {
         let mut host = PluginHost::new(engine);
-        let simulation_handle = profile
+        let patched = profile
             .clone()
             .with_patch("core.render", false)
-            .with_patch("core.fbx", false)
-            .instantiate(&mut host, None, false, false)?
+            .with_patch("core.fbx", false);
+        let simulation_handle = bootstrap::instantiate(&patched, &mut host, None, false, false)?
             .into_iter()
             .find(|handle| handle.id() == SimulationPlugin::ID);
         let sample_capacity = if collect_benchmark {
@@ -393,24 +395,26 @@ impl ApplicationHandler for ClientApp {
         match event_loop.create_window(attributes) {
             Ok(window) => {
                 let window = Arc::new(window);
-                let result = self
-                    .profile
-                    .clone()
-                    .with_patch("core.simulation", false)
-                    .instantiate(
-                        &mut self.host,
-                        Some(Arc::clone(&window)),
-                        self.collect_benchmark,
-                        self.hot_reload,
-                    )
-                    .and_then(|_| self.host.run_stage(SystemStage::Startup));
+                let patched = self.profile.clone().with_patch("core.simulation", false);
+                let result = bootstrap::instantiate(
+                    &patched,
+                    &mut self.host,
+                    Some(Arc::clone(&window)),
+                    self.collect_benchmark,
+                    self.hot_reload,
+                )
+                .and_then(|_| {
+                    self.host
+                        .run_stage(SystemStage::Startup)
+                        .map_err(anyhow::Error::new)
+                });
                 match result {
                     Ok(()) => {
                         self.window = Some(window);
                         self.last_update = Instant::now();
                     }
                     Err(error) => {
-                        self.failure = Some(anyhow::Error::new(error));
+                        self.failure = Some(error);
                         event_loop.exit();
                     }
                 }
@@ -478,7 +482,7 @@ impl ApplicationHandler for ClientApp {
                                     .push(started.elapsed().as_secs_f64() * 1_000.0);
                                 let preparation = self
                                     .host
-                                    .plugin_mut::<RenderPlugin>(RenderPlugin::ID)
+                                    .render_api_mut(CORE_RENDER)
                                     .expect("render plugin is registered")
                                     .last_preparation_time();
                                 self.preparation_samples

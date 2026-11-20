@@ -5,7 +5,7 @@ use anyhow::{Context, bail};
 use serde::Serialize;
 use serde_json::json;
 
-use crate::engine::{Engine, Event};
+use moni_core::engine::{Engine, Event};
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct BenchmarkSummary {
@@ -63,7 +63,7 @@ impl BenchmarkReport {
 }
 
 pub fn write_report(report: &BenchmarkReport, raw_path: &str) -> anyhow::Result<()> {
-    let path = crate::workspace_path(raw_path)?;
+    let path = moni_core::workspace_path(raw_path)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -131,6 +131,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
 
     let source = read_script(script.as_deref(), scene)?;
     let mut engine = create_engine(scene, source)?;
+    engine.set_script_runtime(Box::new(moni_script::QuickJsScriptRuntime::new()));
     let mut samples = Vec::with_capacity((frames - warmup_frames) as usize);
     for frame in 0..frames {
         let started = Instant::now();
@@ -185,7 +186,7 @@ fn parse_positive(value: Option<&String>, option: &str) -> anyhow::Result<u64> {
 fn read_script(script: Option<&str>, _scene: &str) -> anyhow::Result<String> {
     let default_script = "examples/dist/model-orbit.js";
     let raw_path = script.unwrap_or(default_script);
-    let path = crate::workspace_path(raw_path)?;
+    let path = moni_core::workspace_path(raw_path)?;
     fs::read_to_string(&path)
         .with_context(|| format!("could not read {}; run npm run build first", path.display()))
 }

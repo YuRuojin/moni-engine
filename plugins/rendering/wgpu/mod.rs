@@ -5,13 +5,17 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use bytemuck::{Pod, Zeroable};
+use moni_assets::fbx::FbxMesh;
+use moni_assets::runtime::AssetRuntime;
+use moni_core::engine::{SpriteKind, World};
+use moni_core::host::{OverlayQuad, RenderStatus};
+use moni_core::scene3d::{Camera3d, CameraProjection, Light, MeshKind, Transform3d, Vector3};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
-use crate::assets::AssetRuntime;
-use crate::engine::{SpriteKind, World};
-use crate::fbx::FbxMesh;
-use crate::scene3d::{Camera3d, CameraProjection, Light, MeshKind, Transform3d, Vector3};
+pub mod plugin;
+
+pub use plugin::RenderPlugin;
 
 const CIRCLE_SEGMENTS: usize = 48;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -145,22 +149,6 @@ struct FbxGpuObject {
     vertex_count: u32,
     model_buffer: wgpu::Buffer,
     model_bind_group: wgpu::BindGroup,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct OverlayQuad {
-    pub x: f64,
-    pub y: f64,
-    pub width: f64,
-    pub height: f64,
-    pub color: [f32; 4],
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RenderStatus {
-    Rendered,
-    Reconfigure,
-    Skip,
 }
 
 pub struct GpuRenderer {

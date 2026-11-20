@@ -1,11 +1,15 @@
+pub mod runtime;
+
+pub use runtime::QuickJsScriptRuntime;
+
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use rquickjs::{Context, Function, Object, Runtime};
 
-use crate::engine::{Entity, Sprite};
-use crate::scene3d::{Model3d, Transform3d, Vector3};
+use moni_core::engine::{Entity, Sprite};
+use moni_core::scene3d::{Model3d, Transform3d, Vector3};
 
 const SCRIPT_TIME_LIMIT: Duration = Duration::from_millis(50);
 const SCRIPT_MEMORY_LIMIT: usize = 32 * 1024 * 1024;
@@ -256,9 +260,9 @@ fn model_to_js<'js>(ctx: &rquickjs::Ctx<'js>, model: &Model3d) -> rquickjs::Resu
     value.set(
         "type",
         match model.kind {
-            crate::scene3d::MeshKind::Cube => "cube",
-            crate::scene3d::MeshKind::Plane => "plane",
-            crate::scene3d::MeshKind::Fbx => "fbx",
+            moni_core::scene3d::MeshKind::Cube => "cube",
+            moni_core::scene3d::MeshKind::Plane => "plane",
+            moni_core::scene3d::MeshKind::Fbx => "fbx",
         },
     )?;
     if let Some(source) = &model.source {
@@ -295,8 +299,8 @@ fn sprite_to_js<'js>(ctx: &rquickjs::Ctx<'js>, sprite: &Sprite) -> rquickjs::Res
     value.set(
         "type",
         match sprite.kind {
-            crate::engine::SpriteKind::Rectangle => "rectangle",
-            crate::engine::SpriteKind::Circle => "circle",
+            moni_core::engine::SpriteKind::Rectangle => "rectangle",
+            moni_core::engine::SpriteKind::Circle => "circle",
         },
     )?;
     value.set("width", sprite.width)?;

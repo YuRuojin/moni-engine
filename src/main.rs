@@ -1,39 +1,23 @@
-#[path = "../plugins/assets/runtime/mod.rs"]
-mod assets;
 mod benchmark;
+mod bootstrap;
 mod client;
-mod components;
-#[path = "../plugins/assets/cooked/mod.rs"]
-mod cooked;
-#[path = "../plugins/editor/scene-viewer/mod.rs"]
-mod editor;
-#[path = "../plugins/editor/scene-viewer/ui.rs"]
-mod editor_ui;
-mod engine;
-#[path = "../plugins/assets/fbx/mod.rs"]
-mod fbx;
-#[path = "../plugins/rendering/wgpu/mod.rs"]
-mod gpu;
-mod host;
-mod plugins;
-mod profile;
-mod project;
-mod protocol;
-mod render;
-mod scene;
-mod scene3d;
-#[path = "../plugins/scripting/quickjs/mod.rs"]
-mod script;
+mod fuzz;
 
 use std::env;
 use std::fs;
 use std::io::{BufRead, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode, Stdio};
+use std::sync::Arc;
 
 use anyhow::{Context as AnyhowContext, bail};
-use engine::Engine;
-use serde_json::json;
+use moni_assets::{cooked, fbx};
+use moni_core::engine::Engine;
+use moni_core::host::{CORE_RENDER, CORE_SIMULATION, PluginHost, SystemStage};
+use moni_core::profile::{self, Profile};
+use moni_core::{project, protocol, scene, workspace_path};
+use moni_script::QuickJsScriptRuntime;
+use serde_json::{Value, json};
 
 fn main() -> ExitCode {
     match run() {
@@ -71,9 +55,10 @@ fn run() -> anyhow::Result<()> {
         Some("doctor") => project_doctor(args.collect()),
         Some("serve") => serve(),
         Some("headless") => headless(args.collect()),
+        Some("fuzz") => fuzz::run(args.collect()),
         Some("profile") => profile_command(args.collect()),
         Some("client") => client::run(args.collect()),
-        Some("editor") => editor::run(args.collect()),
+        Some("editor") => editor_command(),
         Some("scene") => scene_roundtrip(args.collect()),
         Some("benchmark") => benchmark::run(args.collect()),
         Some("demo") => demo(args.collect()),
@@ -86,7 +71,9 @@ fn print_help() -> anyhow::Result<()> {
         "moni-engine\n\nCommands:\n  cook INPUT [--output PATH] [--isolate]
                             Convert FBX to a cooked .mnec mesh
   new PATH                  Create an independent game repository\n  run [--frames N]          Build and run the project in the current directory\n  doctor [--update-lock] [--rollback-lock] [--accept-permissions]
-                            Validate project, scene, profile, and lockfile\n  capabilities              Print the machine-readable control schema\n  serve                     Serve NDJSON requests on stdin/stdout\n  headless [--profile NAME] [--scene PATH]\n                            Resolve and inspect a headless profile\n  profile [list|dump] [--profile NAME] [--patch ID=on|off]\n                            Inspect profiles and effective plugin trees\n  client [--scene 2d|3d] [--script PATH] [--frames N]\n         [--benchmark --warmup N --output PATH] [--hot-reload]\n                            Open the winit/wgpu client\n  editor [--scene PATH] [--frames N] [--hot-reload]\n                            Open the read-only .mnsc scene viewer\n  scene PATH [--output PATH] [--name NAME]\n                            Migrate and round-trip a .mnsc scene\n  benchmark [--scene 2d|3d] [--script PATH] [--frames N]\n            [--warmup N] [--output PATH]\n                            Measure release simulation ticks\n  demo [--ticks N] [--output PATH] [--snapshot PATH] [--script PATH]\n\nScript workflow:\n  npm install\n  npm run build\n  cargo run -- client\n  cargo run -- client --scene 3d\n  npm run benchmark"
+                            Validate project, scene, profile, and lockfile\n  fuzz [--target cooked|scene|fbx] [--iterations N] [--seed S]
+                            Structured in-process parser fuzzing
+  capabilities              Print the machine-readable control schema\n  serve                     Serve NDJSON requests on stdin/stdout\n  headless [--profile NAME] [--scene PATH]\n                            Resolve and inspect a headless profile\n  profile [list|dump] [--profile NAME] [--patch ID=on|off] [--plugin-config ID=JSON]\n                            Inspect profiles and effective plugin trees\n  client [--scene 2d|3d] [--script PATH] [--frames N]\n         [--benchmark --warmup N --output PATH] [--hot-reload]\n                            Open the winit/wgpu client\n  editor [--scene PATH] [--frames N] [--hot-reload]\n                            Open the read-only .mnsc scene viewer\n  scene PATH [--output PATH] [--name NAME]\n                            Migrate and round-trip a .mnsc scene\n  benchmark [--scene 2d|3d] [--script PATH] [--frames N]\n            [--warmup N] [--output PATH]\n                            Measure release simulation ticks\n  demo [--ticks N] [--output PATH] [--snapshot PATH] [--script PATH]\n\nScript workflow:\n  npm install\n  npm run build\n  cargo run -- client\n  cargo run -- client --scene 3d\n  npm run benchmark"
     );
     Ok(())
 }
@@ -96,6 +83,7 @@ fn serve() -> anyhow::Result<()> {
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
     let mut engine = Engine::new();
+    engine.set_script_runtime(Box::new(QuickJsScriptRuntime::new()));
 
     for line in stdin.lock().lines() {
         let line = line?;
@@ -326,6 +314,7 @@ fn project_doctor(args: Vec<String>) -> anyhow::Result<()> {
     let scene_path = project.scene_path(&root)?;
     let entities = scene::validate_scene_file(&scene_path)?;
     let effective = project.profile()?.resolve(&profile::Target::current())?;
+    project.check_direct_dependencies(&effective)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -385,14 +374,13 @@ fn headless(args: Vec<String>) -> anyhow::Result<()> {
     let world = scene::load_scene(&workspace_path(&scene_path)?)?;
     let mut engine = Engine::new();
     engine.load_world(world)?;
-    let mut host = host::PluginHost::new(engine);
-    let profile = profile::Profile::named(&profile_name)?;
-    let effective = profile.resolve(&profile::Target::current())?;
-    profile.instantiate(&mut host, None, false, false)?;
-    host.run_stage(host::SystemStage::Startup)?;
-    let gpu_initialized = host.has_plugin(plugins::RenderPlugin::ID);
-    let quickjs_initialized =
-        host.has_plugin(plugins::SimulationPlugin::ID) || host.script_host_count() != 0;
+    let mut host = PluginHost::new(engine);
+    let profile = Profile::named(&profile_name)?;
+    let effective = profile.resolve(&moni_core::profile::Target::current())?;
+    bootstrap::instantiate(&profile, &mut host, None, false, false)?;
+    host.run_stage(SystemStage::Startup)?;
+    let gpu_initialized = host.has_plugin(CORE_RENDER);
+    let quickjs_initialized = host.has_plugin(CORE_SIMULATION) || host.script_host_count() != 0;
     if gpu_initialized || quickjs_initialized {
         bail!("headless profile initialized a forbidden runtime provider");
     }
@@ -416,7 +404,8 @@ fn profile_command(args: Vec<String>) -> anyhow::Result<()> {
     let mut action = "dump";
     let mut profile_name = None;
     let mut target = profile::Target::current();
-    let mut patches = Vec::new();
+    let mut patches: Vec<(String, bool)> = Vec::new();
+    let mut configs: Vec<(String, Value)> = Vec::new();
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -431,11 +420,30 @@ fn profile_command(args: Vec<String>) -> anyhow::Result<()> {
             }
             "--patch" => {
                 index += 1;
-                patches.push(
-                    args.get(index)
-                        .ok_or_else(|| anyhow::anyhow!("--patch requires ID=on|off"))?
-                        .clone(),
-                );
+                let raw = args
+                    .get(index)
+                    .ok_or_else(|| anyhow::anyhow!("--patch requires ID=on|off"))?;
+                let (id, enabled) = raw
+                    .rsplit_once('=')
+                    .ok_or_else(|| anyhow::anyhow!("--patch must use ID=on|off"))?;
+                let enabled = match enabled {
+                    "on" => true,
+                    "off" => false,
+                    _ => bail!("--patch must use ID=on|off"),
+                };
+                patches.push((id.to_string(), enabled));
+            }
+            "--plugin-config" => {
+                index += 1;
+                let raw = args
+                    .get(index)
+                    .ok_or_else(|| anyhow::anyhow!("--plugin-config requires ID=JSON"))?;
+                let (id, json) = raw
+                    .split_once('=')
+                    .ok_or_else(|| anyhow::anyhow!("--plugin-config must use ID=JSON"))?;
+                let value: Value = serde_json::from_str(json)
+                    .with_context(|| format!("--plugin-config '{id}' has invalid JSON"))?;
+                configs.push((id.to_string(), value));
             }
             "--os" => {
                 index += 1;
@@ -487,20 +495,27 @@ fn profile_command(args: Vec<String>) -> anyhow::Result<()> {
     } else {
         profile::Profile::named("default")?
     };
-    for patch in patches {
-        let (id, enabled) = patch
-            .rsplit_once('=')
-            .ok_or_else(|| anyhow::anyhow!("--patch must use ID=on|off"))?;
-        let enabled = match enabled {
-            "on" => true,
-            "off" => false,
-            _ => bail!("--patch must use ID=on|off"),
-        };
-        profile = profile.with_patch(id, enabled);
+    for (id, enabled) in patches {
+        profile = profile.with_patch(&id, enabled);
+    }
+    for (id, value) in configs {
+        profile = profile.with_config(&id, value);
     }
     let effective = profile.resolve(&target)?;
     println!("{}", serde_json::to_string_pretty(&effective.dump())?);
     Ok(())
+}
+
+fn editor_command() -> anyhow::Result<()> {
+    moni_editor::run(
+        env::args().skip(2).collect(),
+        Box::new(|host, window, hot_reload| {
+            let profile = Profile::named("editor").map_err(|error| anyhow::anyhow!("{error}"))?;
+            bootstrap::instantiate(&profile, host, Some(Arc::clone(window)), true, hot_reload)?;
+            host.run_stage(SystemStage::Startup)?;
+            Ok(())
+        }),
+    )
 }
 
 fn scene_roundtrip(args: Vec<String>) -> anyhow::Result<()> {
@@ -591,8 +606,11 @@ fn demo(args: Vec<String>) -> anyhow::Result<()> {
         };
         index += 1;
     }
-    if ticks == 0 || ticks > engine::MAX_STEP_COUNT {
-        bail!("--ticks must be between 1 and {}", engine::MAX_STEP_COUNT);
+    if ticks == 0 || ticks > moni_core::engine::MAX_STEP_COUNT {
+        bail!(
+            "--ticks must be between 1 and {}",
+            moni_core::engine::MAX_STEP_COUNT
+        );
     }
 
     let script_path = workspace_path(&script)?;
@@ -604,8 +622,9 @@ fn demo(args: Vec<String>) -> anyhow::Result<()> {
     })?;
 
     let mut engine = demo_engine(source)?;
+    engine.set_script_runtime(Box::new(QuickJsScriptRuntime::new()));
     let step_result = engine.step(ticks)?;
-    let svg = render::render_svg(engine.world());
+    let svg = moni_core::render::render_svg(engine.world());
 
     let output_path = workspace_path(&output)?;
     if let Some(parent) = output_path.parent() {
@@ -651,23 +670,6 @@ fn external_model_engine(_source: String, scene_path: &str) -> anyhow::Result<En
     let mut engine = Engine::new();
     engine.load_world(world)?;
     Ok(engine)
-}
-
-fn workspace_path(raw_path: &str) -> anyhow::Result<PathBuf> {
-    if raw_path.trim().is_empty() {
-        bail!("path must not be empty");
-    }
-    let path = Path::new(raw_path);
-    let has_forbidden_component = path.components().any(|component| {
-        matches!(
-            component,
-            Component::Prefix(_) | Component::RootDir | Component::ParentDir
-        )
-    });
-    if path.is_absolute() || has_forbidden_component {
-        bail!("paths must stay inside the current workspace");
-    }
-    Ok(env::current_dir()?.join(path))
 }
 
 #[cfg(test)]
@@ -763,5 +765,15 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn fuzz_smoke_completes_without_panics() {
+        fuzz::run(vec![
+            "--iterations".to_string(),
+            "60".to_string(),
+            "--seed".to_string(),
+            "7".to_string(),
+        ])
+        .expect("fuzz smoke run should not catch parser panics");
     }
 }

@@ -1,5 +1,5 @@
-use crate::engine::World;
-use crate::gpu::OverlayQuad;
+use moni_core::engine::World;
+use moni_core::host::OverlayQuad;
 
 const TEXT_COLOR: [f32; 4] = [0.85, 0.9, 1.0, 1.0];
 const MUTED_COLOR: [f32; 4] = [0.45, 0.6, 0.8, 1.0];

@@ -3,21 +3,24 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, bail};
+use moni_core::engine::Engine;
+use moni_core::host::{CORE_RENDER, PluginHost, RenderStatus, SystemStage};
+use moni_core::scene3d::{Camera3d, CameraProjection, Vector3};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
-use crate::editor_ui::build_overlay;
-use crate::engine::Engine;
-use crate::gpu::RenderStatus;
-use crate::host::{PluginHost, SystemStage};
-use crate::plugins::RenderPlugin;
-use crate::profile::Profile;
-use crate::scene3d::{Camera3d, CameraProjection, Vector3};
+pub mod ui;
 
-pub fn run(args: Vec<String>) -> anyhow::Result<()> {
+use ui::build_overlay;
+
+/// Composition hook supplied by the binary: installs the profile's plugins
+/// once the window exists. The editor itself never names a concrete plugin.
+pub type Bootstrap = dyn FnOnce(&mut PluginHost, &Arc<Window>, bool) -> anyhow::Result<()>;
+
+pub fn run(args: Vec<String>, bootstrap: Box<Bootstrap>) -> anyhow::Result<()> {
     let mut scene_path = "testing/assets/benchmark-3d.mnsc".to_string();
     let mut golden_path = None;
     let mut frame_limit = 0_u64;
@@ -35,7 +38,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
             "--hot-reload" => hot_reload = true,
             "--golden" => {
                 index += 1;
-                golden_path = Some(crate::workspace_path(
+                golden_path = Some(moni_core::workspace_path(
                     args.get(index)
                         .ok_or_else(|| anyhow::anyhow!("--golden requires a path"))?,
                 )?);
@@ -56,8 +59,8 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
         index += 1;
     }
 
-    let path = crate::workspace_path(&scene_path)?;
-    let world = crate::scene::load_scene(&path)?;
+    let path = moni_core::workspace_path(&scene_path)?;
+    let world = moni_core::scene::load_scene(&path)?;
     let mut engine = Engine::new();
     engine.load_world(world)?;
     let mut host = PluginHost::new(engine);
@@ -65,7 +68,14 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
     host.world_mut().viewport.height = 540;
     let event_loop = EventLoop::new().context("could not create the editor event loop")?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = EditorApp::new(host, scene_path, frame_limit, golden_path, hot_reload);
+    let mut app = EditorApp::new(
+        host,
+        scene_path,
+        frame_limit,
+        golden_path,
+        hot_reload,
+        bootstrap,
+    );
     event_loop
         .run_app(&mut app)
         .context("the editor event loop failed")?;
@@ -74,8 +84,8 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
     }
     let loaded_mesh_vertices = app
         .host
-        .plugin_mut::<RenderPlugin>(RenderPlugin::ID)
-        .map_or(0, |plugin| plugin.loaded_mesh_vertices());
+        .render_api_mut(CORE_RENDER)
+        .map_or(0, |render| render.loaded_mesh_vertices());
     println!(
         "{}",
         serde_json::json!({
@@ -99,6 +109,7 @@ struct EditorApp {
     frames: u64,
     frame_ms: f64,
     hot_reload: bool,
+    bootstrap: Option<Box<Bootstrap>>,
     gpu_samples: Vec<(f32, f32)>,
     golden_mode: bool,
     golden_path: Option<PathBuf>,
@@ -112,6 +123,7 @@ impl EditorApp {
         frame_limit: u64,
         golden_path: Option<PathBuf>,
         hot_reload: bool,
+        bootstrap: Box<Bootstrap>,
     ) -> Self {
         Self {
             initial_camera: host.world().camera.clone(),
@@ -122,6 +134,7 @@ impl EditorApp {
             frames: 0,
             frame_ms: 0.0,
             hot_reload,
+            bootstrap: Some(bootstrap),
             gpu_samples: Vec::new(),
             golden_mode: golden_path.is_some(),
             golden_path,
@@ -173,20 +186,16 @@ impl ApplicationHandler for EditorApp {
         match event_loop.create_window(attributes) {
             Ok(window) => {
                 let window = Arc::new(window);
-                let result = Profile::named("editor")
-                    .and_then(|profile| {
-                        profile.instantiate(
-                            &mut self.host,
-                            Some(Arc::clone(&window)),
-                            true,
-                            self.hot_reload,
-                        )
-                    })
-                    .and_then(|_| self.host.run_stage(SystemStage::Startup));
+                let bootstrap = self.bootstrap.take().expect("editor bootstrap runs once");
+                let result = bootstrap(&mut self.host, &window, self.hot_reload).and_then(|()| {
+                    self.host
+                        .run_stage(SystemStage::Startup)
+                        .map_err(anyhow::Error::new)
+                });
                 match result {
                     Ok(()) => self.window = Some(window),
                     Err(error) => {
-                        self.failure = Some(anyhow::Error::new(error));
+                        self.failure = Some(error);
                         event_loop.exit();
                     }
                 }
@@ -226,11 +235,11 @@ impl ApplicationHandler for EditorApp {
             WindowEvent::RedrawRequested => {
                 let (preparation_ms, loaded_vertices) = self
                     .host
-                    .plugin_mut::<RenderPlugin>(RenderPlugin::ID)
-                    .map(|plugin| {
+                    .render_api_mut(CORE_RENDER)
+                    .map(|render| {
                         (
-                            plugin.last_preparation_time().as_secs_f64() * 1_000.0,
-                            plugin.loaded_mesh_vertices(),
+                            render.last_preparation_time().as_secs_f64() * 1_000.0,
+                            render.loaded_mesh_vertices(),
                         )
                     })
                     .unwrap_or((0.0, 0));
@@ -246,24 +255,21 @@ impl ApplicationHandler for EditorApp {
                         loaded_vertices,
                     )
                 };
-                if let Some(render_plugin) = self.host.plugin_mut::<RenderPlugin>(RenderPlugin::ID)
-                {
-                    render_plugin.set_overlay_quads(overlay);
+                if let Some(render) = self.host.render_api_mut(CORE_RENDER) {
+                    render.set_overlay_quads(overlay);
                 }
                 if let Some(path) = self.golden_path.take()
-                    && let Some(plugin) = self.host.plugin_mut::<RenderPlugin>(RenderPlugin::ID)
+                    && let Some(render) = self.host.render_api_mut(CORE_RENDER)
                 {
-                    plugin.capture_next(path);
+                    render.capture_next(path);
                 }
                 let started = Instant::now();
                 match self.host.run_stage(SystemStage::Render) {
                     Ok(()) => match self.host.last_render_status() {
                         Some(RenderStatus::Rendered) => {
                             self.frame_ms = started.elapsed().as_secs_f64() * 1_000.0;
-                            if let Some(plugin) =
-                                self.host.plugin_mut::<RenderPlugin>(RenderPlugin::ID)
-                            {
-                                self.gpu_samples.extend(plugin.take_gpu_samples());
+                            if let Some(render) = self.host.render_api_mut(CORE_RENDER) {
+                                self.gpu_samples.extend(render.take_gpu_samples());
                             }
                             self.frames += 1;
                             if self.frame_limit != 0 && self.frames >= self.frame_limit {

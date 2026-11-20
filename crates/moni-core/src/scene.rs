@@ -406,8 +406,11 @@ mod tests {
 
     #[test]
     fn load_reads_scene_asset_aliases() {
-        let world = load_scene(std::path::Path::new("testing/assets/benchmark-3d.mnsc"))
-            .expect("benchmark scene loads");
+        // Test binaries run with the member crate as CWD; anchor on the repo
+        // root via the crate manifest location.
+        let scene_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testing/assets/benchmark-3d.mnsc");
+        let world = load_scene(&scene_path).expect("benchmark scene loads");
         assert_eq!(
             world.asset_aliases.get("terrain").map(String::as_str),
             Some("testing/assets/benchmark.mnec")

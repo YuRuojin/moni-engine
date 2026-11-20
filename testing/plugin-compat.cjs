@@ -95,4 +95,11 @@ verify("golden-rendering", () => {
   if (fs.readFileSync(first.replace(/\.rgba$/i, ".json"), "utf8") !== fs.readFileSync(second.replace(/\.rgba$/i, ".json"), "utf8")) throw new Error("golden metadata differs");
 });
 
+verify("structured-fuzz-smoke", () => {
+  const report = json(["fuzz", "--iterations", "400", "--seed", "7"]);
+  const outcomes = report.outcomes || {};
+  if (report.panics && report.panics.length > 0) throw new Error("fuzzer caught parser panics");
+  if (!outcomes.ok && !outcomes.rejected) throw new Error("fuzzer produced no outcomes");
+});
+
 console.log(JSON.stringify({ ok: true, results }, null, 2));
