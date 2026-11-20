@@ -5,9 +5,10 @@ use std::fmt::{Display, Formatter};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::script::{HookOutput, ScriptHost};
+use crate::scene3d::{Camera3d, Light, Model3d, Transform3d, Vector3};
+use crate::script::{HookOutput, ScriptFailure, ScriptHost};
 
-pub const SNAPSHOT_VERSION: u32 = 1;
+pub const SNAPSHOT_VERSION: u32 = 2;
 pub const DEFAULT_TICK_RATE: u32 = 60;
 pub const MAX_STEP_COUNT: u64 = 10_000;
 pub const MAX_SCRIPT_BYTES: usize = 256 * 1024;
@@ -149,6 +150,8 @@ impl ScriptSpec {
 #[serde(deny_unknown_fields)]
 pub struct ScriptState {
     pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
     #[serde(default = "script_enabled")]
     pub enabled: bool,
     #[serde(default)]
@@ -164,6 +167,7 @@ impl ScriptState {
         spec.validate()?;
         Ok(Self {
             source: spec.source,
+            source_path: None,
             enabled: true,
             last_error: None,
         })
@@ -179,6 +183,8 @@ pub struct EntitySpec {
     pub transform: Transform,
     #[serde(default)]
     pub sprite: Option<Sprite>,
+    #[serde(default)]
+    pub model: Option<Model3d>,
     #[serde(default)]
     pub script: Option<ScriptSpec>,
 }
@@ -197,6 +203,9 @@ impl EntitySpec {
         if let Some(sprite) = &self.sprite {
             sprite.validate()?;
         }
+        if let Some(model) = &self.model {
+            model.validate()?;
+        }
         if let Some(script) = &self.script {
             script.validate()?;
         }
@@ -213,7 +222,11 @@ pub struct Entity {
     #[serde(default)]
     pub sprite: Option<Sprite>,
     #[serde(default)]
+    pub model: Option<Model3d>,
+    #[serde(default)]
     pub script: Option<ScriptState>,
+    #[serde(default)]
+    pub extensions: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -280,6 +293,12 @@ pub struct World {
     #[serde(default)]
     pub viewport: Viewport,
     #[serde(default)]
+    pub camera: Camera3d,
+    #[serde(default = "default_lights")]
+    pub lights: Vec<Light>,
+    #[serde(default)]
+    pub extensions: BTreeMap<String, Value>,
+    #[serde(default)]
     pub entities: BTreeMap<EntityId, Entity>,
 }
 
@@ -291,6 +310,19 @@ fn first_entity_id() -> EntityId {
     1
 }
 
+fn default_lights() -> Vec<Light> {
+    vec![Light::Directional {
+        direction: Vector3 {
+            x: -0.45,
+            y: -0.8,
+            z: -0.35,
+        },
+        color: [1.0, 1.0, 1.0],
+        intensity: 1.0,
+        shadows: false,
+    }]
+}
+
 impl Default for World {
     fn default() -> Self {
         Self {
@@ -299,6 +331,9 @@ impl Default for World {
             tick_rate: DEFAULT_TICK_RATE,
             next_entity_id: first_entity_id(),
             viewport: Viewport::default(),
+            camera: Camera3d::default(),
+            lights: default_lights(),
+            extensions: BTreeMap::new(),
             entities: BTreeMap::new(),
         }
     }
@@ -322,6 +357,10 @@ impl World {
             ));
         }
         self.viewport.validate()?;
+        self.camera.validate()?;
+        for light in &self.lights {
+            light.validate()?;
+        }
 
         let mut highest_id = 0;
         for (key, entity) in &self.entities {
@@ -337,6 +376,9 @@ impl World {
             entity.transform.validate()?;
             if let Some(sprite) = &entity.sprite {
                 sprite.validate()?;
+            }
+            if let Some(model) = &entity.model {
+                model.validate()?;
             }
             if let Some(script) = &entity.script {
                 validate_script_source(&script.source)?;
@@ -384,6 +426,10 @@ pub enum Event {
     SpriteChanged {
         entity: EntityId,
     },
+    ModelChanged {
+        entity: EntityId,
+    },
+    CameraChanged,
     ScriptAttached {
         entity: EntityId,
     },
@@ -434,6 +480,17 @@ pub enum Command {
         entity: EntityId,
         sprite: Option<Sprite>,
     },
+    SetModel {
+        entity: EntityId,
+        model: Option<Model3d>,
+    },
+    SetModelTransform {
+        entity: EntityId,
+        transform: Transform3d,
+    },
+    SetCamera {
+        camera: Camera3d,
+    },
     AttachScript {
         entity: EntityId,
         source: String,
@@ -448,6 +505,7 @@ pub enum Command {
 pub struct Engine {
     world: World,
     events: Vec<Event>,
+    script_hosts: BTreeMap<EntityId, ScriptHost>,
 }
 
 impl Engine {
@@ -459,18 +517,32 @@ impl Engine {
         &self.world
     }
 
+    pub fn world_mut(&mut self) -> &mut World {
+        &mut self.world
+    }
+
     pub fn take_events(&mut self) -> Vec<Event> {
         std::mem::take(&mut self.events)
     }
 
+    pub fn script_host_count(&self) -> usize {
+        self.script_hosts.len()
+    }
+
+    pub fn shutdown_runtime(&mut self) {
+        self.script_hosts.clear();
+    }
+
     pub fn reset(&mut self) {
         self.world = World::default();
+        self.script_hosts.clear();
         self.events.push(Event::WorldReset);
     }
 
     pub fn load_world(&mut self, world: World) -> Result<(), EngineError> {
         world.validate()?;
         self.world = world;
+        self.script_hosts.clear();
         self.events.push(Event::WorldLoaded);
         Ok(())
     }
@@ -490,7 +562,9 @@ impl Engine {
                         name,
                         transform: spec.transform,
                         sprite: spec.sprite,
+                        model: spec.model,
                         script,
+                        extensions: BTreeMap::new(),
                     },
                 );
                 self.events.push(Event::EntitySpawned { entity: id });
@@ -500,6 +574,7 @@ impl Engine {
                 if self.world.entities.remove(&entity).is_none() {
                     return Err(entity_not_found(entity));
                 }
+                self.script_hosts.remove(&entity);
                 self.events.push(Event::EntityDespawned { entity });
                 Ok(json!({ "entity": entity }))
             }
@@ -519,14 +594,44 @@ impl Engine {
                 self.events.push(Event::SpriteChanged { entity });
                 Ok(json!({ "entity": entity }))
             }
+            Command::SetModel { entity, model } => {
+                if let Some(model) = &model {
+                    model.validate()?;
+                }
+                let target = self.entity_mut(entity)?;
+                target.model = model;
+                self.events.push(Event::ModelChanged { entity });
+                Ok(json!({ "entity": entity }))
+            }
+            Command::SetModelTransform { entity, transform } => {
+                transform.validate()?;
+                let target = self.entity_mut(entity)?;
+                let model = target.model.as_mut().ok_or_else(|| {
+                    EngineError::new(
+                        "model_not_found",
+                        format!("entity {entity} does not have a 3D model"),
+                    )
+                })?;
+                model.transform = transform;
+                self.events.push(Event::ModelChanged { entity });
+                Ok(json!({ "entity": entity }))
+            }
+            Command::SetCamera { camera } => {
+                camera.validate()?;
+                self.world.camera = camera;
+                self.events.push(Event::CameraChanged);
+                Ok(json!({ "camera": "updated" }))
+            }
             Command::AttachScript { entity, source } => {
                 validate_script_source(&source)?;
                 let target = self.entity_mut(entity)?;
                 target.script = Some(ScriptState {
                     source,
+                    source_path: None,
                     enabled: true,
                     last_error: None,
                 });
+                self.script_hosts.remove(&entity);
                 self.events.push(Event::ScriptAttached { entity });
                 Ok(json!({ "entity": entity }))
             }
@@ -586,7 +691,7 @@ impl Engine {
             let Some(script) = entity.script.as_ref() else {
                 continue;
             };
-            match ScriptHost::run_tick(&entity, &script.source, tick, dt) {
+            match self.run_script(&entity, &script.source, tick, dt) {
                 Ok(output) => self.collect_script_output(entity.id, output, &mut pending_commands),
                 Err(error) => {
                     if let Some(current) = self.world.entities.get_mut(&entity.id)
@@ -595,6 +700,7 @@ impl Engine {
                         script.enabled = false;
                         script.last_error = Some(error.message.clone());
                     }
+                    self.script_hosts.remove(&entity.id);
                     self.events.push(Event::ScriptError {
                         entity: entity.id,
                         code: error.code,
@@ -614,6 +720,24 @@ impl Engine {
             }
         }
         self.world.tick += 1;
+    }
+
+    fn run_script(
+        &mut self,
+        entity: &Entity,
+        source: &str,
+        tick: u64,
+        dt: f64,
+    ) -> Result<HookOutput, ScriptFailure> {
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            self.script_hosts.entry(entity.id)
+        {
+            entry.insert(ScriptHost::new(source)?);
+        }
+        self.script_hosts
+            .get_mut(&entity.id)
+            .expect("script host was inserted")
+            .run_tick(entity, tick, dt)
     }
 
     fn collect_script_output(

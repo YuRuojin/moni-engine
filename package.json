@@ -5,7 +5,10 @@
   "scripts": {
     "build": "tsc -p examples/tsconfig.json",
     "check": "tsc -p examples/tsconfig.json --noEmit",
-    "demo": "npm run build && cargo run -- demo"
+    "demo": "npm run build && cargo run -- client",
+    "demo:3d": "npm run build && cargo run -- client --scene 3d",
+    "editor": "npm run build && cargo run -- editor",
+    "benchmark": "npm run build && node testing/run-benchmarks.cjs"
   },
   "devDependencies": {
     "typescript": "5.9.3"

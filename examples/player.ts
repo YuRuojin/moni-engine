@@ -1,4 +1,4 @@
-function onTick(ctx: ScriptContext, dt: number): void {
+var onTick = function (ctx: ScriptContext, dt: number): void {
   const transform = ctx.entity.transform;
   ctx.setTransform({
     x: transform.x + 60 * dt,
@@ -9,4 +9,4 @@ function onTick(ctx: ScriptContext, dt: number): void {
   if (ctx.tick % 60 === 0) {
     ctx.log(`player tick ${ctx.tick}`);
   }
-}
+};

@@ -6,8 +6,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::engine::{Command, Engine, EngineError, EntitySpec, Event, Sprite, Transform, World};
+use crate::engine::{Command, Engine, EngineError, EntitySpec, Event, Sprite, Transform};
 use crate::render::render_svg;
+use crate::scene3d::{Camera3d, Model3d, Transform3d};
 
 #[derive(Debug, Deserialize)]
 pub struct Request {
@@ -58,6 +59,26 @@ struct SetSpriteArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SetModelArgs {
+    entity: u64,
+    model: Option<Model3d>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetModelTransformArgs {
+    entity: u64,
+    transform: Transform3d,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetCameraArgs {
+    camera: Camera3d,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AttachScriptArgs {
     entity: u64,
     source: String,
@@ -97,7 +118,7 @@ struct PathArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LoadSnapshotArgs {
-    snapshot: World,
+    snapshot: Value,
 }
 
 pub fn handle_line(engine: &mut Engine, line: &str) -> (Response, bool) {
@@ -176,6 +197,23 @@ fn dispatch(engine: &mut Engine, command: &str, args: Value) -> (Result<Value, E
                 sprite: args.sprite,
             })
         }),
+        "set_model" => parse_args::<SetModelArgs>(args).and_then(|args| {
+            engine.apply(Command::SetModel {
+                entity: args.entity,
+                model: args.model,
+            })
+        }),
+        "set_model_transform" => parse_args::<SetModelTransformArgs>(args).and_then(|args| {
+            engine.apply(Command::SetModelTransform {
+                entity: args.entity,
+                transform: args.transform,
+            })
+        }),
+        "set_camera" => parse_args::<SetCameraArgs>(args).and_then(|args| {
+            engine.apply(Command::SetCamera {
+                camera: args.camera,
+            })
+        }),
         "attach_script" => parse_args::<AttachScriptArgs>(args).and_then(|args| {
             engine.apply(Command::AttachScript {
                 entity: args.entity,
@@ -197,7 +235,9 @@ fn dispatch(engine: &mut Engine, command: &str, args: Value) -> (Result<Value, E
             )
         }),
         "load_snapshot" => parse_args::<LoadSnapshotArgs>(args).and_then(|args| {
-            engine.load_world(args.snapshot)?;
+            let world = crate::scene::snapshot_from_value(args.snapshot)
+                .map_err(|error| EngineError::new("invalid_snapshot", error.to_string()))?;
+            engine.load_world(world)?;
             Ok(json!({ "loaded": true }))
         }),
         "save" => parse_args::<PathArgs>(args).and_then(|args| save(engine, &args.path)),
@@ -263,7 +303,7 @@ fn load(engine: &mut Engine, raw_path: &str) -> Result<Value, EngineError> {
     let path = workspace_path(raw_path, false)?;
     let contents =
         fs::read_to_string(&path).map_err(|error| io_error("could not read snapshot", error))?;
-    let world = serde_json::from_str::<World>(&contents)
+    let world = crate::scene::load_snapshot(&contents)
         .map_err(|error| EngineError::new("invalid_snapshot", error.to_string()))?;
     engine.load_world(world)?;
     Ok(json!({ "path": raw_path }))
@@ -316,9 +356,25 @@ pub fn capabilities() -> Value {
         "protocol": "moni-engine-control/1",
         "transport": "NDJSON over stdin/stdout",
         "world": {
-            "snapshotVersion": 1,
+            "snapshotVersion": 2,
             "tickRate": 60,
-            "coordinateSystem": "2D pixels, y down, rotation in radians"
+            "coordinateSystem": "2D pixels with y down; right-handed 3D with y up; rotations in radians",
+            "camera3d": "Perspective or orthographic camera with position, target, fov_y, orthographic_height, near and far",
+            "meshes3d": ["cube", "plane", "fbx"],
+            "fbxModel": "Workspace-relative source path; geometry and base colors loaded once per renderer",
+            "scene": {
+                "format": "moni-scene",
+                "version": 2,
+                "readVersions": [1, 2],
+                "extension": "mnsc",
+                "source": "Declarative camera, lights, entities and workspace-relative component resources"
+            },
+            "rendering": {
+                "material": "Base color, metallic and roughness",
+                "lights": "One directional light plus up to 8 point lights",
+                "shadows": "1024x1024 directional shadow map with 3x3 PCF",
+                "gpuTimestamps": "Optional benchmark-only main and shadow pass timings"
+            }
         },
         "commands": {
             "capabilities": { "args": {} },
@@ -326,6 +382,9 @@ pub fn capabilities() -> Value {
             "despawn": { "args": { "entity": "number" } },
             "set_transform": { "args": { "entity": "number", "transform": "Transform" } },
             "set_sprite": { "args": { "entity": "number", "sprite": "Sprite|null" } },
+            "set_model": { "args": { "entity": "number", "model": "Model3d|null" } },
+            "set_model_transform": { "args": { "entity": "number", "transform": "Transform3d" } },
+            "set_camera": { "args": { "camera": "Camera3d" } },
             "attach_script": { "args": { "entity": "number", "source": "compiled JavaScript" } },
             "set_script_enabled": { "args": { "entity": "number", "enabled": "boolean" } },
             "step": { "args": { "count": "1..10000" } },
@@ -338,9 +397,21 @@ pub fn capabilities() -> Value {
             "reset": { "args": {} },
             "quit": { "args": {} }
         },
+        "components": crate::components::ComponentRegistry::new().agent_schemas(),
+        "host": {
+            "scheduler": "single-thread dependency-ordered static plugins",
+            "maxSystemTasks": 1024,
+            "stages": ["startup", "fixed_update", "render", "shutdown"],
+            "threadAffinity": {
+                "core.simulation": "logic",
+                "core.render": "render"
+            }
+        },
         "script": {
             "language": "TypeScript compiled to JavaScript",
             "runtime": "QuickJS",
+            "contextLifetime": "persistent per scripted entity; source evaluated once; reset on replacement, world load, or error",
+            "snapshot": "script source only; JavaScript heap is not persisted",
             "hook": "function onTick(ctx: ScriptContext, dt: number): void",
             "limits": {
                 "timePerHookMilliseconds": 50,
@@ -355,6 +426,8 @@ pub fn capabilities() -> Value {
             "entity_despawned",
             "transform_changed",
             "sprite_changed",
+            "model_changed",
+            "camera_changed",
             "script_attached",
             "script_enabled_changed",
             "script_log",

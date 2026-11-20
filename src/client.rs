@@ -1,28 +1,48 @@
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, bail};
+use serde_json::json;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
+use crate::benchmark::{BenchmarkReport, write_report};
 use crate::engine::Engine;
-use crate::gpu::{GpuRenderer, RenderStatus};
+use crate::gpu::RenderStatus;
+use crate::host::{PluginHandle, PluginHost, SystemStage};
+use crate::plugins::{RenderPlugin, SimulationPlugin};
+use crate::profile::Profile;
 
 pub fn run(args: Vec<String>) -> anyhow::Result<()> {
-    let mut script = "examples/dist/player.js".to_string();
+    let mut script = None;
+    let mut scene = "2d";
     let mut frame_limit = 0_u64;
+    let mut benchmark = false;
+    let mut warmup_frames = 0_u64;
+    let mut output = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--script" => {
                 index += 1;
-                script = args
+                script = Some(
+                    args.get(index)
+                        .ok_or_else(|| anyhow::anyhow!("--script requires a path"))?
+                        .clone(),
+                );
+            }
+            "--scene" => {
+                index += 1;
+                scene = args
                     .get(index)
-                    .ok_or_else(|| anyhow::anyhow!("--script requires a path"))?
-                    .clone();
+                    .ok_or_else(|| anyhow::anyhow!("--scene requires 2d or 3d"))?;
+                if scene != "2d" && scene != "3d" {
+                    bail!("--scene must be 2d or 3d");
+                }
             }
             "--frames" => {
                 index += 1;
@@ -35,11 +55,42 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
                     bail!("--frames must be at least 1");
                 }
             }
+            "--benchmark" => benchmark = true,
+            "--warmup" => {
+                index += 1;
+                warmup_frames = args
+                    .get(index)
+                    .ok_or_else(|| anyhow::anyhow!("--warmup requires a value"))?
+                    .parse()
+                    .context("--warmup must be a non-negative integer")?;
+            }
+            "--output" => {
+                index += 1;
+                output = Some(
+                    args.get(index)
+                        .ok_or_else(|| anyhow::anyhow!("--output requires a path"))?
+                        .clone(),
+                );
+            }
             unknown => bail!("unknown client option '{unknown}'"),
         }
         index += 1;
     }
+    if benchmark {
+        if cfg!(debug_assertions) {
+            bail!("client benchmarks require a release build");
+        }
+        if frame_limit == 0 {
+            bail!("client benchmarks require --frames");
+        }
+        if warmup_frames >= frame_limit {
+            bail!("--warmup must be smaller than --frames");
+        }
+    } else if warmup_frames != 0 || output.is_some() {
+        bail!("--warmup and --output require --benchmark");
+    }
 
+    let script = script.unwrap_or_else(|| "examples/dist/model-orbit.js".to_string());
     let script_path = crate::workspace_path(&script)?;
     let source = std::fs::read_to_string(&script_path).with_context(|| {
         format!(
@@ -47,46 +98,180 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
             script_path.display()
         )
     })?;
-    let engine = crate::demo_engine(source)?;
+    let engine = if scene == "3d" {
+        crate::demo_engine_3d(source)?
+    } else {
+        crate::demo_engine(source)?
+    };
     let event_loop = EventLoop::new().context("could not create the window event loop")?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = ClientApp::new(engine, frame_limit);
+    let mut app = ClientApp::new(engine, frame_limit, benchmark, warmup_frames)?;
     event_loop
         .run_app(&mut app)
         .context("the window event loop failed")?;
+    if let Some(error) = app.failure.take() {
+        return Err(error);
+    }
+
+    let mut benchmark_result = None;
+    if benchmark {
+        let output = output.unwrap_or_else(|| format!("target/benchmarks/render-{scene}.json"));
+        let report = BenchmarkReport::new(
+            "render_cpu",
+            "gpu_renderer_render_including_present",
+            scene,
+            app.rendered_frames,
+            warmup_frames,
+            std::mem::take(&mut app.frame_samples),
+        )?;
+        write_report(&report, &output)?;
+        let preparation_output = Path::new(&output)
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(format!("render-preparation-{scene}.json"))
+            .to_string_lossy()
+            .into_owned();
+        let preparation_report = BenchmarkReport::new(
+            "render_preparation_cpu",
+            "vertices_uniforms_and_vertex_buffer_creation",
+            scene,
+            app.rendered_frames,
+            warmup_frames,
+            std::mem::take(&mut app.preparation_samples),
+        )?;
+        write_report(&preparation_report, &preparation_output)?;
+        let render_plugin = app
+            .host
+            .plugin_mut::<RenderPlugin>(RenderPlugin::ID)
+            .expect("render plugin is registered");
+        let gpu_samples = render_plugin.take_gpu_samples();
+        let gpu_supported = render_plugin.gpu_timestamps_supported();
+        let gpu_result = if gpu_supported {
+            let parent = Path::new(&output).parent().unwrap_or_else(|| Path::new(""));
+            let shadow_path = parent
+                .join(format!("gpu-shadow-{scene}.json"))
+                .to_string_lossy()
+                .into_owned();
+            let main_path = parent
+                .join(format!("gpu-main-{scene}.json"))
+                .to_string_lossy()
+                .into_owned();
+            let shadow_samples: Vec<f64> = gpu_samples
+                .iter()
+                .map(|(shadow, _)| f64::from(*shadow))
+                .collect();
+            let main_samples: Vec<f64> = gpu_samples
+                .iter()
+                .map(|(_, main)| f64::from(*main))
+                .collect();
+            let shadow_report = BenchmarkReport::new(
+                "gpu",
+                "directional_shadow_pass",
+                scene,
+                app.rendered_frames,
+                warmup_frames,
+                shadow_samples,
+            )?;
+            let main_report = BenchmarkReport::new(
+                "gpu",
+                "main_render_pass",
+                scene,
+                app.rendered_frames,
+                warmup_frames,
+                main_samples,
+            )?;
+            write_report(&shadow_report, &shadow_path)?;
+            write_report(&main_report, &main_path)?;
+            json!({
+                "supported": true,
+                "shadow": { "output": shadow_path, "summary": shadow_report.summary },
+                "main": { "output": main_path, "summary": main_report.summary },
+            })
+        } else {
+            json!({ "supported": false })
+        };
+        benchmark_result = Some(json!({
+            "output": output,
+            "summary": report.summary,
+            "preparation": {
+                "output": preparation_output,
+                "summary": preparation_report.summary,
+            },
+            "gpu": gpu_result,
+        }));
+    }
+    let loaded_mesh_vertices = app
+        .host
+        .plugin_mut::<RenderPlugin>(RenderPlugin::ID)
+        .map_or(0, |plugin| plugin.loaded_mesh_vertices());
+    let simulation_plugin = app.simulation_handle.as_ref().map(PluginHandle::id);
+    if let Some(handle) = app.simulation_handle.take() {
+        handle.dispose(&mut app.host)?;
+    }
     println!(
         "{}",
-        serde_json::json!({
+        serde_json::to_string_pretty(&json!({
             "ok": true,
+            "scene": scene,
+            "simulationPlugin": simulation_plugin,
             "frames": app.rendered_frames,
-            "tick": app.engine.world().tick,
-            "entities": app.engine.world().entities.len()
-        })
+            "tick": app.host.world().tick,
+            "entities": app.host.world().entities.len(),
+            "loadedMeshVertices": loaded_mesh_vertices,
+            "benchmark": benchmark_result,
+        }))?
     );
     Ok(())
 }
 
 struct ClientApp {
-    engine: Engine,
+    host: PluginHost,
+    simulation_handle: Option<PluginHandle>,
     window: Option<Arc<Window>>,
-    renderer: Option<GpuRenderer>,
     last_update: Instant,
     accumulator_seconds: f64,
     frame_limit: u64,
     rendered_frames: u64,
+    collect_benchmark: bool,
+    warmup_frames: u64,
+    frame_samples: Vec<f64>,
+    preparation_samples: Vec<f64>,
+    failure: Option<anyhow::Error>,
 }
 
 impl ClientApp {
-    fn new(engine: Engine, frame_limit: u64) -> Self {
-        Self {
-            engine,
+    fn new(
+        engine: Engine,
+        frame_limit: u64,
+        collect_benchmark: bool,
+        warmup_frames: u64,
+    ) -> anyhow::Result<Self> {
+        let mut host = PluginHost::new(engine);
+        let simulation_handle = Profile::named("default")?
+            .with_patch("core.render", false)
+            .with_patch("core.fbx", false)
+            .instantiate(&mut host, None, false)?
+            .into_iter()
+            .find(|handle| handle.id() == SimulationPlugin::ID);
+        let sample_capacity = if collect_benchmark {
+            (frame_limit - warmup_frames) as usize
+        } else {
+            0
+        };
+        Ok(Self {
+            host,
+            simulation_handle,
             window: None,
-            renderer: None,
             last_update: Instant::now(),
             accumulator_seconds: 0.0,
             frame_limit,
             rendered_frames: 0,
-        }
+            collect_benchmark,
+            warmup_frames,
+            frame_samples: Vec::with_capacity(sample_capacity),
+            preparation_samples: Vec::with_capacity(sample_capacity),
+            failure: None,
+        })
     }
 
     fn advance_simulation(&mut self) -> anyhow::Result<()> {
@@ -95,13 +280,15 @@ impl ClientApp {
         self.last_update = now;
         self.accumulator_seconds += elapsed;
 
-        let tick_seconds = 1.0 / f64::from(self.engine.world().tick_rate);
+        let tick_seconds = 1.0 / f64::from(self.host.world().tick_rate);
         let steps = (self.accumulator_seconds / tick_seconds).floor() as u64;
         if steps == 0 {
             return Ok(());
         }
         let applied_steps = steps.min(5);
-        self.engine.step(applied_steps)?;
+        for _ in 0..applied_steps {
+            self.host.run_stage(SystemStage::FixedUpdate)?;
+        }
         if steps > applied_steps {
             self.accumulator_seconds = 0.0;
         } else {
@@ -116,7 +303,7 @@ impl ApplicationHandler for ClientApp {
         if self.window.is_some() {
             return;
         }
-        let viewport = &self.engine.world().viewport;
+        let viewport = &self.host.world().viewport;
         let attributes = Window::default_attributes()
             .with_title("Moni Engine")
             .with_inner_size(winit::dpi::LogicalSize::new(
@@ -126,20 +313,28 @@ impl ApplicationHandler for ClientApp {
         match event_loop.create_window(attributes) {
             Ok(window) => {
                 let window = Arc::new(window);
-                match GpuRenderer::new(Arc::clone(&window)) {
-                    Ok(renderer) => {
+                let result = Profile::named("default")
+                    .and_then(|profile| {
+                        profile.with_patch("core.simulation", false).instantiate(
+                            &mut self.host,
+                            Some(Arc::clone(&window)),
+                            self.collect_benchmark,
+                        )
+                    })
+                    .and_then(|_| self.host.run_stage(SystemStage::Startup));
+                match result {
+                    Ok(()) => {
                         self.window = Some(window);
-                        self.renderer = Some(renderer);
                         self.last_update = Instant::now();
                     }
                     Err(error) => {
-                        eprintln!("could not initialize wgpu: {error:#}");
+                        self.failure = Some(anyhow::Error::new(error));
                         event_loop.exit();
                     }
                 }
             }
             Err(error) => {
-                eprintln!("could not create the client window: {error}");
+                self.failure = Some(anyhow::anyhow!(error));
                 event_loop.exit();
             }
         }
@@ -167,41 +362,54 @@ impl ApplicationHandler for ClientApp {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
-                if let Some(renderer) = &mut self.renderer {
-                    renderer.resize(size.width, size.height);
-                }
+                self.host.resize(size.width, size.height);
                 window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
                 if let Err(error) = self.advance_simulation() {
-                    eprintln!("simulation failed: {error:#}");
+                    self.failure = Some(error);
                     event_loop.exit();
                     return;
                 }
-                let events = self.engine.take_events();
+                let events = self.host.take_events();
                 window.set_title(&format!(
                     "Moni Engine | tick {} | entities {} | events {}",
-                    self.engine.world().tick,
-                    self.engine.world().entities.len(),
+                    self.host.world().tick,
+                    self.host.world().entities.len(),
                     events.len()
                 ));
-                if let Some(renderer) = &mut self.renderer {
-                    match renderer.render(self.engine.world()) {
-                        Ok(RenderStatus::Rendered) => {
+                let started = self.collect_benchmark.then(Instant::now);
+                match self.host.run_stage(SystemStage::Render) {
+                    Ok(()) => match self.host.last_render_status() {
+                        Some(RenderStatus::Rendered) => {
                             self.rendered_frames += 1;
+                            if let Some(started) = started
+                                && self.rendered_frames > self.warmup_frames
+                            {
+                                self.frame_samples
+                                    .push(started.elapsed().as_secs_f64() * 1_000.0);
+                                let preparation = self
+                                    .host
+                                    .plugin_mut::<RenderPlugin>(RenderPlugin::ID)
+                                    .expect("render plugin is registered")
+                                    .last_preparation_time();
+                                self.preparation_samples
+                                    .push(preparation.as_secs_f64() * 1_000.0);
+                            }
                             if self.frame_limit != 0 && self.rendered_frames >= self.frame_limit {
                                 event_loop.exit();
                             }
                         }
-                        Ok(RenderStatus::Skip) => {}
-                        Ok(RenderStatus::Reconfigure) => {
+                        Some(RenderStatus::Skip) => {}
+                        Some(RenderStatus::Reconfigure) => {
                             let size = window.inner_size();
-                            renderer.resize(size.width, size.height);
+                            self.host.resize(size.width, size.height);
                         }
-                        Err(error) => {
-                            eprintln!("render failed: {error:#}");
-                            event_loop.exit();
-                        }
+                        None => {}
+                    },
+                    Err(error) => {
+                        self.failure = Some(anyhow::Error::new(error));
+                        event_loop.exit();
                     }
                 }
                 window.request_redraw();
