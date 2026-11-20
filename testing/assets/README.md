@@ -13,13 +13,15 @@
 
 ## 本地用例
 
-- `garden_diorama.fbx`：花园立体模型。
-- `xujiahui_cyber_geo.fbx`：徐家汇赛博场景模型。
-- `orthographic.mnsc`：正交 2D 视图测试场景。
-- `perspective.mnsc`：透视 3D 视图测试场景。
+- `garden_diorama.fbx`：花园立体模型（约 49 万顶点）。
+- `xujiahui_cyber_geo.fbx`：徐家汇赛博场景模型（约 148 万顶点）。
+- `garden_diorama.mnsc`：花园立体模型 3D 视图场景（方向光阴影 + 冷色点光）。
+- `xujiahui_cyber_geo.mnsc`：赛博城市场景（方向光阴影 + 双色点光，金属质感）。
+- `orthographic.mnsc`：正交 2D 视图测试场景（可选）。
+- `perspective.mnsc`：透视 3D 视图测试场景（可选）。
 
-两个本地 `.mnsc` v2 场景引用相同的 FBX 实体，并声明相机、灯光、材质和脚本资源路径，不在 `src/` 中硬编码测试实体。加载器同时保留 v1 读取与 v1→v2 迁移能力。
+场景为 `.mnsc` v2 格式，引用同目录 FBX 并声明相机、灯光和材质，不在 `src/` 中硬编码测试实体。加载器同时保留 v1 读取与 v1→v2 迁移能力。FBX 加载器将模型归一化到 [-1, 1] 盒，场景相机按此取 3/4 视角。
 
-本地文件由使用者自行提供并放在本目录。缺少文件时，相关演示应明确失败并提示路径，不能静默回退到内置实体。模型格式和几何由引擎在运行时解析，二进制测试资源不提交到仓库。
+文件由使用者自行提供并放在本目录（不入 Git）。`testing/plugin-compat.cjs` 在这些场景存在时逐个用编辑器打开并渲染，校验顶点数；缺失时跳过并注明原因。缺少文件的演示应明确失败并提示路径，不能静默回退到内置实体。
 
 资源导入架构属于 [`plugins/assets/`](../../plugins/assets/README.md)，基准入口见 [`testing/README.md`](../README.md)。

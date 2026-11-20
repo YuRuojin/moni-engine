@@ -102,4 +102,23 @@ verify("structured-fuzz-smoke", () => {
   if (!outcomes.ok && !outcomes.rejected) throw new Error("fuzzer produced no outcomes");
 });
 
+// Local test models live in the gitignored testing/assets folder; when a
+// developer provides them, every suite run opens both 3D scenes end to end.
+const localScenes = [
+  ["testing/assets/garden_diorama.mnsc", "garden-diorama"],
+  ["testing/assets/xujiahui_cyber_geo.mnsc", "xujiahui-cyber-geo"],
+];
+for (const [scenePath, name] of localScenes) {
+  if (!fs.existsSync(scenePath)) {
+    console.log(`skip - local-model-scene:${name} (${scenePath} not provided)`);
+    continue;
+  }
+  verify(`local-model-scene:${name}`, () => {
+    const output = json(["editor", "--scene", scenePath, "--frames", "2"]);
+    if (!output.loadedMeshVertices || output.loadedMeshVertices <= 0) {
+      throw new Error(`${name} rendered no mesh vertices`);
+    }
+  });
+}
+
 console.log(JSON.stringify({ ok: true, results }, null, 2));
