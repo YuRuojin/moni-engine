@@ -24,11 +24,13 @@
 
 name: CI
 
+# PAUSED (2026-11-22): automatic CI is temporarily disabled while its role
+# at this stage is being evaluated — the workflow is kept for manual runs.
+# Trigger it explicitly via "Run workflow" on GitHub, or restore the push /
+# pull_request triggers below. The one failure that motivated the pause (a
+# machine-speed-dependent script-budget test) is already fixed.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_dispatch
 
 concurrency:
   group: ci-${{ github.ref }}

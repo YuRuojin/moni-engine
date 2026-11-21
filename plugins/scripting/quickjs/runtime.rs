@@ -26,6 +26,10 @@ pub struct QuickJsScriptRuntime {
     /// the cumulative time exceeds it, remaining runnable entities are
     /// skipped (not disabled) for that tick.
     tick_budget: Duration,
+    /// Injectable clock for budget accounting; production uses `Instant::now`.
+    /// Tests inject a stepped fake clock so budget exhaustion is deterministic
+    /// instead of depending on machine speed (CI runners vary widely).
+    now: Box<dyn Fn() -> Instant>,
 }
 
 impl QuickJsScriptRuntime {
@@ -39,7 +43,15 @@ impl QuickJsScriptRuntime {
         Self {
             hosts: BTreeMap::new(),
             tick_budget: budget,
+            now: Box::new(Instant::now),
         }
+    }
+
+    /// Replaces the budget clock. Production always measures `Instant::now`;
+    /// tests pass a stepped fake clock so budget accounting is deterministic.
+    pub fn with_clock(mut self, now: Box<dyn Fn() -> Instant>) -> Self {
+        self.now = now;
+        self
     }
 
     /// Sets the wall-time budget shared by all script hooks within one tick.
@@ -149,9 +161,9 @@ impl ScriptRuntime for QuickJsScriptRuntime {
                     continue;
                 };
                 host.assert_logic_thread();
-                let started = Instant::now();
+                let started = (self.now)();
                 let result = host.run_tick(entity, tick, dt);
-                budget_used += started.elapsed();
+                budget_used += (self.now)().duration_since(started);
                 result
             };
             match run_result {
@@ -207,7 +219,7 @@ fn disable_script(world: &mut World, entity_id: EntityId, failure: &crate::Scrip
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use moni_core::engine::{
         Command, Entity, EntityId, Event, ScriptRuntime, ScriptState, ScriptTickOutput, World,
@@ -245,21 +257,24 @@ function onTick(ctx, dt) {
 "#;
 
     /// Arithmetic busy loop sized to exceed a 1ms tick budget by a wide
-    /// margin while staying far under the 50ms per-hook limit: measured at
-    /// roughly 10ms per run in the debug test profile and roughly 4ms in
-    /// release on the reference dev machine. The log carries the exact sum,
-    /// proving the loop ran to completion instead of timing out.
+    /// A moderate loop that completes well under the 50ms per-hook limit on
+    /// any plausible machine (20000 iterations take single-digit
+    /// milliseconds even in debug builds on slow runners). Budget
+    /// exhaustion is driven by the injected test clock, not by this loop's
+    /// real runtime, so the test stays deterministic across hardware. The
+    /// log carries the exact sum, proving the loop ran to completion
+    /// instead of timing out.
     const BUSY_SOURCE: &str = r#"
 function onTick(ctx, dt) {
   let sum = 0;
-  for (let i = 0; i < 150000; i++) {
+  for (let i = 0; i < 20000; i++) {
     sum += i;
   }
   ctx.log("busy-" + sum);
 }
 "#;
 
-    const BUSY_SUM: &str = "busy-11249925000";
+    const BUSY_SUM: &str = "busy-199990000";
 
     fn scripted_entity(id: EntityId, source: &str) -> Entity {
         Entity {
@@ -439,21 +454,36 @@ function onTick(ctx, dt) {
         assert_eq!(script_logs(&output), vec![]);
     }
 
+    /// A stepped fake clock: every call advances the returned instant by
+    /// one step, so each measured `run_tick` consumes exactly one step of
+    /// budget regardless of how fast the machine really is.
+    fn stepped_clock(step_ms: u64) -> Box<dyn Fn() -> Instant> {
+        let base = Instant::now();
+        let call_index = std::cell::Cell::new(0u64);
+        Box::new(move || {
+            let index = call_index.get();
+            call_index.set(index + 1);
+            base + Duration::from_millis(step_ms * index)
+        })
+    }
+
     #[test]
     fn budget_exhaustion_skips_remaining_entities_without_disabling() {
         let mut world = world_with(vec![
             scripted_entity(1, BUSY_SOURCE),
             scripted_entity(2, COUNTER_SOURCE),
         ]);
+        // Every measured run consumes exactly 5ms of fake budget time.
+        let mut runtime = QuickJsScriptRuntime::with_tick_budget(Duration::from_secs(1))
+            .with_clock(stepped_clock(5));
         // Generous budget: both scripts run and entity 2 gets a host.
-        let mut runtime = QuickJsScriptRuntime::with_tick_budget(Duration::from_secs(1));
         let output = runtime.tick(&mut world, 1, 0.016);
         assert_eq!(script_logs(&output), vec![(1, BUSY_SUM), (2, "count-1")]);
         assert_eq!(runtime.host_count(), 2);
 
-        // Entity 1 alone exhausts the tiny budget, so entity 2 is skipped for
-        // this tick: reported, but neither disabled nor evicted.
-        runtime.set_tick_budget(Duration::from_millis(1));
+        // Entity 1 alone consumes the whole 5ms budget, so entity 2 is
+        // skipped for this tick: reported, but neither disabled nor evicted.
+        runtime.set_tick_budget(Duration::from_millis(5));
         let output = runtime.tick(&mut world, 2, 0.016);
         assert_eq!(script_errors(&output), vec![(2, "script_budget_exceeded")]);
         assert_eq!(runtime.host_count(), 2, "skipped scripts keep their hosts");
