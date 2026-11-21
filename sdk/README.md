@@ -49,7 +49,11 @@
 
 ## 场景格式
 
-[Moni Scene v2](scene-format.md) 定义 `.mnsc` 的声明式相机、灯光、实体、组件和资源引用，并由 `src/scene.rs` 转换为经过校验的 `World`；v1 通过相邻迁移读取。[组件与属性 schema](component-schema.md) 统一内置组件注册、校验和 agent 描述。
+[Moni Scene v2](scene-format.md) 定义 `.mnsc` 的声明式相机、灯光、实体、组件和资源引用，并由 `crates/moni-core/src/scene.rs` 转换为经过校验的 `World`；v1 通过相邻迁移读取。[组件与属性 schema](component-schema.md) 统一内置组件注册、校验和 agent 描述。
+
+## Agent 控制面
+
+[MCP 适配器](mcp.md) 定义 `moni mcp` 的工具面：MCP 是控制面的薄适配器，全部变更经 `RuntimeSession` 命令分发，与 NDJSON 语义一致。
 
 ## 当前限制
 

@@ -30,3 +30,8 @@ moni-script = { path = "plugins/scripting/quickjs" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 winit = "0.30"
+# MCP stdio server. rmcp is async-first (tokio); the async scope stays inside
+# the mcp module and never reaches engine code, which stays single-threaded.
+# Pinned exactly: the MCP SDK surface is still moving between minor versions.
+rmcp = { version = "=3.11.0", features = ["server", "transport-io"] }
+tokio = { version = "1", features = ["rt", "macros", "io-std", "sync", "time"] }

@@ -40,6 +40,36 @@ pub fn serve_session() -> anyhow::Result<RuntimeSession> {
     Ok(session)
 }
 
+/// Builds the MCP-server session: the same composition as
+/// [`serve_session`] (Engine + QuickJS + the `serve` profile, simulation
+/// started so ticks run through the plugin host), plus an optional initial
+/// scene loaded through `RuntimeSession::load_scene` before the simulation
+/// starts, mirroring the windowed client's composition order. The session
+/// lives for the whole MCP server lifetime; tools operate on it
+/// sequentially from the dedicated engine thread.
+pub fn mcp_session(scene_path: Option<&str>) -> anyhow::Result<RuntimeSession> {
+    let mut engine = Engine::new();
+    engine.set_script_runtime(Box::new(QuickJsScriptRuntime::new()));
+    let profile = Profile::named("serve")?;
+    let mut session = RuntimeSession::new(engine, profile.clone());
+    register_profile(&profile, session.host_mut(), None)?;
+    // Load the scene before starting simulation so script startup and the
+    // Startup stage observe the loaded world, like the windowed client.
+    if let Some(scene_path) = scene_path {
+        session.load_scene(scene_path)?;
+    }
+    if session
+        .host_mut()
+        .has_plugin(moni_core::host::CORE_SIMULATION)
+    {
+        session
+            .host_mut()
+            .start_plugin(moni_core::host::CORE_SIMULATION)?;
+        session.host_mut().run_stage(SystemStage::Startup)?;
+    }
+    Ok(session)
+}
+
 /// Builds the windowed-client session following the directive composition
 /// order: register the profile's plugins (no window — `core.render` stays
 /// registered-but-unstarted), load and validate the scene against the

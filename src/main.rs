@@ -2,6 +2,7 @@ mod benchmark;
 mod bootstrap;
 mod client;
 mod fuzz;
+mod mcp;
 
 use std::env;
 use std::fs;
@@ -54,6 +55,7 @@ fn run() -> anyhow::Result<()> {
         Some("run") => project_run(args.collect()),
         Some("doctor") => project_doctor(args.collect()),
         Some("serve") => serve(),
+        Some("mcp") => mcp::run(args.collect()),
         Some("headless") => headless(args.collect()),
         Some("fuzz") => fuzz::run(args.collect()),
         Some("profile") => profile_command(args.collect()),
@@ -73,7 +75,7 @@ fn print_help() -> anyhow::Result<()> {
   new PATH                  Create an independent game repository\n  run [--frames N]          Build and run the project in the current directory\n  doctor [--update-lock] [--rollback-lock] [--accept-permissions]
                             Validate project, scene, profile, and lockfile\n  fuzz [--target cooked|scene|fbx] [--iterations N] [--seed S]
                             Structured in-process parser fuzzing
-  capabilities              Print the machine-readable control schema\n  serve                     Serve NDJSON requests on stdin/stdout\n  headless [--profile NAME] [--scene PATH]\n                            Resolve and inspect a headless profile\n  profile [list|dump] [--profile NAME] [--patch ID=on|off] [--plugin-config ID=JSON]\n                            Inspect profiles and effective plugin trees\n  client [--scene 2d|3d] [--script PATH] [--frames N]\n         [--benchmark --warmup N --output PATH] [--hot-reload]\n                            Open the winit/wgpu client\n  editor [--scene PATH] [--frames N] [--hot-reload]\n                            Open the editable .mnsc scene editor (hierarchy + inspector)\n  scene PATH [--output PATH] [--name NAME]\n                            Migrate and round-trip a .mnsc scene\n  benchmark [--scene 2d|3d] [--script PATH] [--frames N]\n            [--warmup N] [--output PATH]\n                            Measure release simulation ticks\n  demo [--ticks N] [--output PATH] [--snapshot PATH] [--script PATH]\n\nScript workflow:\n  npm install\n  npm run build\n  cargo run -- client\n  cargo run -- client --scene 3d\n  npm run benchmark"
+  capabilities              Print the machine-readable control schema\n  serve                     Serve NDJSON requests on stdin/stdout\n  mcp [--scene PATH] [--project]\n                            Serve MCP tools over stdio (thin adapter over the\n                            same RuntimeSession command path as serve)\n  headless [--profile NAME] [--scene PATH]\n                            Resolve and inspect a headless profile\n  profile [list|dump] [--profile NAME] [--patch ID=on|off] [--plugin-config ID=JSON]\n                            Inspect profiles and effective plugin trees\n  client [--scene 2d|3d] [--script PATH] [--frames N]\n         [--benchmark --warmup N --output PATH] [--hot-reload]\n                            Open the winit/wgpu client\n  editor [--scene PATH] [--frames N] [--hot-reload]\n                            Open the editable .mnsc scene editor (hierarchy + inspector)\n  scene PATH [--output PATH] [--name NAME]\n                            Migrate and round-trip a .mnsc scene\n  benchmark [--scene 2d|3d] [--script PATH] [--frames N]\n            [--warmup N] [--output PATH]\n                            Measure release simulation ticks\n  demo [--ticks N] [--output PATH] [--snapshot PATH] [--script PATH]\n\nScript workflow:\n  npm install\n  npm run build\n  cargo run -- client\n  cargo run -- client --scene 3d\n  npm run benchmark"
     );
     Ok(())
 }
@@ -483,7 +485,7 @@ fn profile_command(args: Vec<String>) -> anyhow::Result<()> {
                     "minimal": [],
                     "default": ["core.simulation", "core.render", "core.fbx"],
                     "headless": [],
-                    "editor": ["core.render", "core.fbx", "core.editor"],
+                    "editor": ["core.render", "core.fbx", "core.editor", "core.simulation"],
                     "serve": ["core.simulation"]
                 }
             }))?
@@ -512,6 +514,11 @@ fn editor_command() -> anyhow::Result<()> {
     moni_editor::run(
         env::args().skip(2).collect(),
         Box::new(|session, window, hot_reload| {
+            // The composition root installs the script runtime so play mode
+            // runs game scripts; outside play they stay inert (no ticks).
+            session
+                .engine_mut()
+                .set_script_runtime(Box::new(QuickJsScriptRuntime::new()));
             // Registration phase only, with the window attached to the render
             // plugin: scene loading and render startup stay inside the editor
             // so they run after its event loop has a surface.

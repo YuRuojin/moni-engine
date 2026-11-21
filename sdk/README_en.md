@@ -47,9 +47,13 @@ The first stage provides version-aligned static Rust interfaces only, with no st
 
 [Static plugin host and lifecycle](plugin-lifecycle_en.md) defines stages, dependencies, access constraints, thread affinity, registration rollback, disposal, and reverse cleanup.
 
+## Agent control plane
+
+[MCP adapter](mcp_en.md) defines the `moni mcp` tool surface: MCP is a thin adapter over the control plane — every mutation goes through `RuntimeSession` command dispatch with NDJSON-identical semantics.
+
 ## Scene format
 
-[Moni Scene v2](scene-format_en.md) defines declarative cameras, lights, entities, components, and resource references in `.mnsc`, converted by `src/scene.rs` into a validated `World`; v1 is read through adjacent migration. [Component and property schemas](component-schema_en.md) unify built-in registration, validation, and agent descriptions.
+[Moni Scene v2](scene-format_en.md) defines declarative cameras, lights, entities, components, and resource references in `.mnsc`, converted by `crates/moni-core/src/scene.rs` into a validated `World`; v1 is read through adjacent migration. [Component and property schemas](component-schema_en.md) unify built-in registration, validation, and agent descriptions.
 
 ## Current limitations
 
