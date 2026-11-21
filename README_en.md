@@ -7,16 +7,18 @@ Moni Engine is a lightweight 2D/3D engine kernel written in Rust. Its goal is a 
 ## Currently runnable
 
 - 2D rectangles, circles, transforms, layers, and SVG output.
-- Basic 3D cubes, planes, and external FBX meshes with orthographic/perspective cameras, depth testing, directional lighting, and material base colors.
-- `.mnsc` v2 with v1 migration, component/property registration, unknown-data preservation, and agent-readable schemas.
+- Basic 3D cubes, planes, and external FBX meshes (FBX meshes with the same source and color are shared by reference on the GPU) with orthographic/perspective cameras, depth testing, directional lighting, and material base colors.
+- `.mnsc` v2 with v1 migration, core component registration, revocable dynamic component registration (schema-validated, stored via entity extensions), component migrators, session-registry scene validation (a failed validation never replaces the current world), unknown-data preservation, and agent-readable schemas.
 - Directional/point lights, basic materials, and directional shadows.
-- An NDJSON command protocol, world snapshots, fixed simulation ticks, and persistent QuickJS scripting.
-- A single-thread static plugin host with dependency/access validation, rollback, and reverse cleanup.
-- Static manifests, domain/target filtering, dependency resolution, profiles/bundles/patches, and effective-tree export.
+- An NDJSON command protocol, world snapshots, fixed simulation ticks, persistent QuickJS scripting (with a global per-tick time budget), unified command metadata (self-described side effects and transactional capabilities), atomic batches, single-command and batch revision-based optimistic concurrency, dry-run previews, and idempotent request IDs.
+- One `RuntimeSession` for `serve`/`client`/`editor`: the same command dispatch, plugin lifecycle, and revision/event semantics.
+- A single-thread static plugin host: two-phase startup (register schemas/services/commands/migrators, then start runtime systems), cached dependency scheduling, runtime access enforcement, a service registry, plugin command registration, cascade unregistration, and full startup-failure rollback.
+- Static manifests, domain/target filtering, dependency resolution, profiles/bundles/patches (including `serve`), and effective-tree export.
 - Independent `.mngp` game projects, lockfiles, a minimal template, and the `new/run/doctor` CLI.
 - Bounded asynchronous assets, reference/cancellation/timeout/cache management, `.mnec` cooked meshes, and concrete official plugin directories.
-- Host-enforced permissions, permission-diff acceptance, SHA-256 integrity, lockfile rollback, isolated imports, golden and compatibility/stability tests.
-- A read-only scene viewer, CPU benchmarks, and main/shadow-pass GPU timestamps.
+- Host-enforced permissions, permission-diff acceptance, SHA-256 manifest integrity, lockfile rollback, isolated imports, golden and compatibility/stability tests.
+- An editable scene editor (egui hierarchy tree, schema-driven inspector, undo/redo, atomic saves), CPU benchmarks, and main/shadow-pass GPU timestamps.
+- GitHub Actions CI: format check, workspace tests, TypeScript checks, the display-free compatibility subset and template E2E (ubuntu), plus a Windows test-parity job.
 - TypeScript declarations and 2D/3D examples.
 
 ```bash

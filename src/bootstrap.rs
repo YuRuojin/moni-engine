@@ -1,29 +1,116 @@
 //! Composition-root plugin factory. This is the ONLY place that names
 //! concrete plugin types: the binary wires the effective profile's plugins
-//! into the host, with rollback on partial failure.
+//! into the host, split into a registration phase (schemas, services,
+//! commands — no World dependency) and a start phase (GPU, script runtime).
 
 use std::sync::Arc;
 
 use winit::window::Window;
 
-use moni_core::host::{Plugin, PluginError, PluginHandle, PluginHost};
+use moni_core::engine::Engine;
+use moni_core::host::{Plugin, PluginError, PluginHandle, PluginHost, SystemStage};
 use moni_core::plugins::SimulationPlugin;
-use moni_core::profile::Profile;
+use moni_core::profile::{Profile, Target};
+use moni_core::session::RuntimeSession;
 use moni_render::plugin::RenderPlugin;
+use moni_script::QuickJsScriptRuntime;
 
-/// Constructs and registers every instance plugin in the profile's effective
-/// tree, in dependency order. Capability providers (core.fbx, core.editor)
-/// contribute only permissions. On any failure the host is restored to its
-/// pre-call state: constructed handles are disposed in reverse order and
-/// capability grants are revoked.
-pub fn instantiate(
+/// Builds the agent/CLI control session: QuickJS plus the `serve` profile.
+/// Registration runs first, then the scene-free startup path: start the
+/// simulation plugin and run the Startup stage, so capabilities reflect the
+/// real running session. This is the same plugin lifecycle the windowed
+/// client and editor run through.
+pub fn serve_session() -> anyhow::Result<RuntimeSession> {
+    let mut engine = Engine::new();
+    engine.set_script_runtime(Box::new(QuickJsScriptRuntime::new()));
+    let profile = Profile::named("serve")?;
+    let mut session = RuntimeSession::new(engine, profile.clone());
+    register_profile(&profile, session.host_mut(), None)?;
+    // The serve profile exists to drive ticks; older profiles could patch
+    // simulation out, in which case the session falls back to engine ticks.
+    if session
+        .host_mut()
+        .has_plugin(moni_core::host::CORE_SIMULATION)
+    {
+        session
+            .host_mut()
+            .start_plugin(moni_core::host::CORE_SIMULATION)?;
+        session.host_mut().run_stage(SystemStage::Startup)?;
+    }
+    Ok(session)
+}
+
+/// Builds the windowed-client session following the directive composition
+/// order: register the profile's plugins (no window — `core.render` stays
+/// registered-but-unstarted), load and validate the scene against the
+/// effective registry, start the simulation plugin, then run the Startup
+/// stage. The render plugin is started later once a window exists.
+///
+/// `scene_path` is workspace-relative as required by
+/// `RuntimeSession::load_scene`; `None` builds an empty world.
+pub fn client_session(
+    scene_path: Option<&str>,
+    profile: Profile,
+    hot_reload: bool,
+) -> anyhow::Result<RuntimeSession> {
+    // Forward the hot-reload flag through an ordered profile patch. A config
+    // patch enables its plugin, so only add it when core.render is actually
+    // in the effective tree.
+    let profile = if hot_reload && profile.resolve(&Target::current())?.contains("core.render") {
+        profile.with_config("core.render", serde_json::json!({ "hotReload": true }))
+    } else {
+        profile
+    };
+    let mut engine = Engine::new();
+    engine.set_script_runtime(Box::new(QuickJsScriptRuntime::new()));
+    let mut session = RuntimeSession::new(engine, profile.clone());
+    register_profile(&profile, session.host_mut(), None)?;
+    if let Some(scene_path) = scene_path {
+        session.load_scene(scene_path)?;
+    }
+    // Start simulation if the profile provides it; render deliberately stays
+    // unstarted until the windowed frontend attaches a surface.
+    if session
+        .host_mut()
+        .has_plugin(moni_core::host::CORE_SIMULATION)
+    {
+        session
+            .host_mut()
+            .start_plugin(moni_core::host::CORE_SIMULATION)?;
+    }
+    session.host_mut().run_stage(SystemStage::Startup)?;
+    Ok(session)
+}
+
+/// Builds a headless inspection session: register the (typically empty)
+/// profile, load the scene into the validated session world, and start
+/// nothing. Forbidden runtime providers therefore stay registered-only at
+/// most, and `has_plugin` checks in the caller keep their meaning.
+pub fn headless_session(profile_name: &str, scene_path: &str) -> anyhow::Result<RuntimeSession> {
+    let profile = Profile::named(profile_name)?;
+    let engine = Engine::new();
+    let mut session = RuntimeSession::new(engine, profile.clone());
+    register_profile(&profile, session.host_mut(), None)?;
+    session.load_scene(scene_path)?;
+    Ok(session)
+}
+
+/// Registration phase only: constructs every instance plugin in the profile's
+/// effective tree, in dependency order, and registers it with
+/// [`PluginHost::register_plugin`]. No plugin is started. Capability
+/// providers (core.fbx, core.editor) contribute only permissions. If a window
+/// is supplied it is attached to the render plugin via `set_window`; without
+/// one the render plugin registers headlessly and fails only when started.
+///
+/// On any failure the host is restored to its pre-call state: constructed
+/// handles are disposed in reverse order and capability grants are revoked,
+/// preserving the old instantiate contract.
+pub fn register_profile(
     profile: &Profile,
     host: &mut PluginHost,
     window: Option<Arc<Window>>,
-    collect_gpu_timestamps: bool,
-    hot_reload: bool,
 ) -> anyhow::Result<Vec<PluginHandle>> {
-    let effective = profile.resolve(&moni_core::profile::Target::current())?;
+    let effective = profile.resolve(&Target::current())?;
     // Capability providers such as core.fbx contribute permissions without a
     // plugin instance. Grant them first so dependent plugins can start, and
     // revoke them again if any later step fails.
@@ -36,7 +123,8 @@ pub fn instantiate(
     }
     // Construct every plugin instance before registering anything so a
     // factory or configuration failure cannot leave partially registered
-    // state behind.
+    // state behind. core.render is constructed window-free; the profile
+    // config (hotReload, collectGpuTimestamps) is applied through configure.
     let mut pending: Vec<(Vec<String>, Box<dyn Plugin>)> = Vec::new();
     let mut construction = Ok(());
     for plugin in effective.plugins() {
@@ -52,18 +140,11 @@ pub fn instantiate(
                 pending.push((plugin.permissions().to_vec(), instance));
             }
             "core.render" => {
-                let Some(window) = window.clone() else {
-                    construction = Err(PluginError::new(
-                        "core.render requires a window but headless was requested",
-                    ));
-                    break;
-                };
-                let mut instance = Box::new(RenderPlugin::new(
-                    window,
-                    collect_gpu_timestamps,
-                    effective.contains("core.fbx"),
-                    hot_reload,
-                )) as Box<dyn Plugin>;
+                let mut instance = RenderPlugin::new(false, effective.contains("core.fbx"), false);
+                if let Some(window) = &window {
+                    instance.set_window(Arc::clone(window));
+                }
+                let mut instance = Box::new(instance) as Box<dyn Plugin>;
                 if let Some(config) = effective.config_for("core.render")
                     && let Err(error) = instance.configure(config)
                 {
@@ -99,7 +180,7 @@ pub fn instantiate(
     // so far in reverse order so the host is left exactly as it started.
     let mut handles = Vec::new();
     for (permissions, plugin) in pending {
-        match host.register_plugin_with_permissions(plugin, &permissions) {
+        match host.register_plugin(plugin, &permissions) {
             Ok(handle) => handles.push(handle),
             Err(error) => {
                 while let Some(handle) = handles.pop() {
@@ -111,6 +192,59 @@ pub fn instantiate(
                 return Err(error.into());
             }
         }
+    }
+    Ok(handles)
+}
+
+/// Startup phase: starts every registered handle in order via
+/// [`PluginHost::start_plugin`]. On failure the error propagates unchanged;
+/// rollback is the caller's decision (see [`instantiate`], which unregisters
+/// everything it registered when a start fails).
+// Part of the composition-root contract and exercised by bootstrap tests;
+// the session builders call `start_plugin` directly for per-plugin control.
+#[allow(dead_code)]
+pub fn start_all(handles: &[PluginHandle], host: &mut PluginHost) -> anyhow::Result<()> {
+    for handle in handles {
+        host.start_plugin(handle.id())?;
+    }
+    Ok(())
+}
+
+/// Combined convenience path: [`register_profile`] then [`start_all`], with
+/// full rollback on start failure — every registered handle is disposed in
+/// reverse order and capability grants are revoked — so existing bootstrap
+/// tests keep their all-or-nothing semantics. Prefer the two-phase functions
+/// when composition must run between registration and start.
+///
+/// `collect_gpu_timestamps` and `hot_reload` are forwarded to the render
+/// plugin as ordered profile patches; they are ignored when core.render is
+/// not in the effective tree (a config patch would re-enable it).
+// Kept as the documented combined path so existing bootstrap tests and
+// simple callers keep their all-or-nothing semantics.
+#[allow(dead_code)]
+pub fn instantiate(
+    profile: &Profile,
+    host: &mut PluginHost,
+    window: Option<Arc<Window>>,
+    collect_gpu_timestamps: bool,
+    hot_reload: bool,
+) -> anyhow::Result<Vec<PluginHandle>> {
+    let mut profile = profile.clone();
+    if profile.resolve(&Target::current())?.contains("core.render") {
+        profile = profile.with_config(
+            "core.render",
+            serde_json::json!({
+                "collectGpuTimestamps": collect_gpu_timestamps,
+                "hotReload": hot_reload,
+            }),
+        );
+    }
+    let handles = register_profile(&profile, host, window)?;
+    if let Err(error) = start_all(&handles, host) {
+        for handle in handles.into_iter().rev() {
+            let _ = handle.dispose(host);
+        }
+        return Err(error);
     }
     Ok(handles)
 }
@@ -208,5 +342,48 @@ mod tests {
         let error = instantiate(&profile, &mut host, None, false, false)
             .expect_err("capability plugin config must fail");
         assert!(error.to_string().contains("no runtime instance"));
+    }
+
+    #[test]
+    fn register_profile_leaves_plugins_registered_but_unstarted() {
+        let mut host = PluginHost::new(Engine::new());
+        let profile = Profile::named("default")
+            .expect("default profile")
+            .with_patch("core.render", false);
+        let handles = register_profile(&profile, &mut host, None).expect("register profile");
+        assert_eq!(handles.len(), 1);
+        assert!(host.has_plugin("core.simulation"));
+        assert!(
+            !host.is_started("core.simulation"),
+            "register_profile must not start plugins"
+        );
+        // The unstarted simulation system does not exist yet, so a stage run
+        // is a no-op instead of ticking the world.
+        host.run_stage(SystemStage::FixedUpdate)
+            .expect("empty stage");
+        assert_eq!(host.world().tick, 0);
+        start_all(&handles, &mut host).expect("start all");
+        assert!(host.is_started("core.simulation"));
+        host.run_stage(SystemStage::FixedUpdate).expect("ticking");
+        assert_eq!(host.world().tick, 1);
+    }
+
+    #[test]
+    fn start_all_failure_propagates_without_rollback() {
+        let mut host = PluginHost::new(Engine::new());
+        let profile = Profile::named("default")
+            .expect("default profile")
+            .with_patch("core.fbx", false);
+        // core.render registers headlessly but cannot start without a window.
+        // Dependency order starts it first, so the error propagates before
+        // core.simulation is reached and nothing is unregistered: callers
+        // that need all-or-nothing semantics use instantiate.
+        let handles = register_profile(&profile, &mut host, None).expect("register profile");
+        assert_eq!(handles.len(), 2);
+        let error = start_all(&handles, &mut host).expect_err("render start needs a window");
+        assert!(error.to_string().contains("requires a window"));
+        assert!(host.has_plugin("core.simulation"));
+        assert!(host.has_plugin("core.render"));
+        assert!(!host.is_started("core.render"));
     }
 }

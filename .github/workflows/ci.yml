@@ -1,0 +1,189 @@
+# Stage-0 engineering gate.
+#
+# The ubuntu job is the full gate: formatting, workspace tests, the TypeScript
+# check, the display-free compatibility contract checks, and a headless
+# template end-to-end run. The full `node testing/plugin-compat.cjs` suite is
+# NOT run here because two of its cases need a windowed runtime: the client
+# permission-denial path creates a winit event loop before the permission
+# check fires (src/client.rs), and golden rendering opens the editor viewer
+# (plugins/editor/scene-viewer). GitHub-hosted ubuntu runners have no display
+# or GPU, so those cases remain a local `npm run test:compat` gate.
+#
+# The windows job exists because the primary development platform is Windows;
+# CI mirrors it for compile/test parity without duplicating the npm gate.
+#
+# Command syntax was verified against src/main.rs:
+# - `cargo run -- <subcommand>` passes the subcommand to moni-engine (the `--`
+#   separator is required, e.g. `cargo run --bin moni-engine -- scene ...`).
+# - `scene`, `headless`, `doctor` resolve relative paths against the current
+#   directory, so the template E2E uses the generated project's own scene.
+# - The template scene references `build/main.js`; `scene` and `headless`
+#   validate that script sources exist, so the E2E builds the project's
+#   TypeScript (`npm ci --ignore-scripts && npm run build`) first.
+# - `client`, `editor`, and `demo` are display-dependent and are never run here.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ubuntu:
+    name: Ubuntu (full gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update stable
+          rustup component add rustfmt --toolchain stable
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run workspace tests
+        run: cargo test --workspace
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Check TypeScript sources
+        run: |
+          npm ci
+          npm run check
+
+      - name: Build engine binary
+        run: cargo build
+
+      - name: Compatibility checks (display-free subset of testing/plugin-compat.cjs)
+        run: |
+          node <<'EOF'
+          // Display-free subset of testing/plugin-compat.cjs for CI runners
+          // without a windowing system or GPU. Cases excluded here (permission
+          // denial, golden rendering) require a winit event loop / windowed
+          // runtime and stay a local `npm run test:compat` gate.
+          const fs = require("fs");
+          const path = require("path");
+          const { spawnSync } = require("child_process");
+
+          const executable = path.join("target", "debug", `moni-engine${process.platform === "win32" ? ".exe" : ""}`);
+          const results = [];
+
+          function run(args, expectedStatus = 0) {
+            const result = spawnSync(executable, args, {
+              encoding: "utf8",
+              maxBuffer: 16 * 1024 * 1024,
+              timeout: 60000,
+            });
+            if (result.error) throw result.error;
+            if (result.status !== expectedStatus) {
+              throw new Error(`${args.join(" ")} exited with ${result.status}, expected ${expectedStatus}\n${result.stdout}\n${result.stderr}`);
+            }
+            return `${result.stdout}\n${result.stderr}`;
+          }
+
+          function json(args) {
+            return JSON.parse(run(args));
+          }
+
+          function verify(name, fn) {
+            fn();
+            results.push({ name, ok: true });
+          }
+
+          fs.mkdirSync(path.join("target", "testing"), { recursive: true });
+
+          verify("capabilities-and-static-api", () => {
+            const capabilities = json(["capabilities"]);
+            if (capabilities.profiles.pluginApiVersion !== 1 || capabilities.host.maxSystemTasks !== 1024 || capabilities.world.assets.queueCapacity !== 64 || !capabilities.components["core.model"]) {
+              throw new Error("capability contract mismatch");
+            }
+          });
+
+          verify("profile-dependency-order", () => {
+            const profile = json(["profile", "dump", "--profile", "default"]);
+            const ids = profile.plugins.map(plugin => plugin.manifest.id);
+            if (ids.join(",") !== "core.fbx,core.render,core.simulation") throw new Error("unexpected default profile");
+          });
+
+          verify("headless-and-minimal", () => {
+            for (const profile of ["headless", "minimal"]) {
+              const result = json(["headless", "--profile", profile]);
+              if (result.gpuInitialized || result.quickjsInitialized || result.fbxLoaded) throw new Error(`${profile} initialized a forbidden provider`);
+            }
+          });
+
+          verify("scene-v2-roundtrip", () => {
+            const output = path.join("target", "testing", "compat-roundtrip.mnsc");
+            json(["scene", "testing/assets/benchmark-3d.mnsc", "--output", output, "--name", "compat"]);
+            const scene = JSON.parse(fs.readFileSync(output, "utf8"));
+            if (scene.version !== 2 || !scene.entities[0].components["core.model"]) throw new Error("scene migration failed");
+          });
+
+          verify("corrupt-input-isolation", () => {
+            // Synthetic binary-FBX header keeps the case self-contained; the
+            // local suite additionally truncates a real FBX when provided.
+            const fixtures = [
+              Buffer.alloc(0),
+              Buffer.from("not an fbx file"),
+              Buffer.concat([
+                Buffer.from("Kaydara FBX Binary  \0\x1a\0", "latin1"),
+                Buffer.from([0x28, 0x00, 0x00, 0x00]), // version 7400
+                Buffer.alloc(160, 0x41),
+              ]),
+            ];
+            fixtures.forEach((contents, index) => {
+              const input = path.join("target", "testing", `corrupt-${index}.fbx`);
+              const output = path.join("target", "testing", `corrupt-${index}.mnec`);
+              fs.writeFileSync(input, contents);
+              run(["cook", input, "--output", output, "--isolate"], 1);
+              if (fs.existsSync(output)) throw new Error("corrupt input produced an output package");
+            });
+          });
+
+          verify("structured-fuzz-smoke", () => {
+            const report = json(["fuzz", "--iterations", "400", "--seed", "7"]);
+            const outcomes = report.outcomes || {};
+            if (report.panics && report.panics.length > 0) throw new Error("fuzzer caught parser panics");
+            if (!outcomes.ok && !outcomes.rejected) throw new Error("fuzzer produced no outcomes");
+          });
+
+          console.log(JSON.stringify({ ok: true, results }, null, 2));
+          EOF
+
+      - name: Template E2E (headless)
+        run: |
+          cargo run -- new target/e2e-game
+          cd target/e2e-game
+          cargo run --bin moni-engine -- doctor
+          # The generated scene references build/main.js; scene and headless
+          # validate script sources, so build the project's TypeScript first.
+          npm ci --ignore-scripts
+          npm run build
+          cargo run --bin moni-engine -- scene scenes/main.mnsc --output target/roundtrip.mnsc
+          cargo run --bin moni-engine -- headless --profile headless --scene scenes/main.mnsc
+
+  windows:
+    name: Windows (test parity)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update stable
+
+      - name: Run workspace tests
+        run: cargo test --workspace

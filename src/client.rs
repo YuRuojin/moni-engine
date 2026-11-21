@@ -12,11 +12,10 @@ use winit::window::{Window, WindowId};
 
 use crate::benchmark::{BenchmarkReport, write_report};
 use crate::bootstrap;
-use moni_core::engine::Engine;
-use moni_core::host::{CORE_RENDER, PluginHandle, PluginHost, RenderStatus, SystemStage};
-use moni_core::plugins::SimulationPlugin;
+use moni_core::host::{CORE_RENDER, CORE_SIMULATION, RenderStatus, SystemStage};
 use moni_core::profile::Profile;
-use moni_script::QuickJsScriptRuntime;
+use moni_core::session::RuntimeSession;
+use moni_render::plugin::RenderPlugin;
 
 pub fn run(args: Vec<String>) -> anyhow::Result<()> {
     run_internal(args, None)
@@ -133,34 +132,6 @@ fn run_internal(args: Vec<String>, profile_override: Option<Profile>) -> anyhow:
     if world_path.is_some() {
         scene = "world";
     }
-    let mut engine = if let Some(world_path) = world_path {
-        let path = if Path::new(&world_path).is_absolute() {
-            PathBuf::from(&world_path)
-        } else {
-            moni_core::workspace_path(&world_path)?
-        };
-        let world = moni_core::scene::load_scene(&path)?;
-        let mut engine = Engine::new();
-        engine.load_world(world)?;
-        engine
-    } else {
-        let script = script.unwrap_or_else(|| "examples/dist/model-orbit.js".to_string());
-        let script_path = moni_core::workspace_path(&script)?;
-        let source = std::fs::read_to_string(&script_path).with_context(|| {
-            format!(
-                "could not read {}; run 'npm install && npm run build' first",
-                script_path.display()
-            )
-        })?;
-        if scene == "3d" {
-            crate::demo_engine_3d(source)?
-        } else {
-            crate::demo_engine(source)?
-        }
-    };
-    engine.set_script_runtime(Box::new(QuickJsScriptRuntime::new()));
-    let event_loop = EventLoop::new().context("could not create the window event loop")?;
-    event_loop.set_control_flow(ControlFlow::Poll);
     let mut profile = match profile_override {
         Some(profile) => profile,
         None => Profile::named(&profile_name)?,
@@ -171,14 +142,56 @@ fn run_internal(args: Vec<String>, profile_override: Option<Profile>) -> anyhow:
             .ok_or_else(|| anyhow::anyhow!("--revoke must use ID=PERMISSION"))?;
         profile = profile.with_revoked_permission(plugin, permission);
     }
-    let mut app = ClientApp::new(
-        engine,
-        frame_limit,
-        benchmark,
-        warmup_frames,
-        profile,
-        hot_reload,
-    )?;
+    // Forward GPU timestamp collection to the render plugin as an ordered
+    // profile patch. A config patch enables its plugin, so only add it when
+    // core.render is actually in the effective tree.
+    if benchmark
+        && profile
+            .resolve(&moni_core::profile::Target::current())?
+            .contains("core.render")
+    {
+        profile = profile.with_config("core.render", json!({ "collectGpuTimestamps": true }));
+    }
+    // The demo scenes still require built example scripts; the check stays
+    // ahead of the event loop so a missing npm build fails immediately.
+    if world_path.is_none() {
+        let script = script.unwrap_or_else(|| "examples/dist/model-orbit.js".to_string());
+        let script_path = moni_core::workspace_path(&script)?;
+        std::fs::read_to_string(&script_path).with_context(|| {
+            format!(
+                "could not read {}; run 'npm install && npm run build' first",
+                script_path.display()
+            )
+        })?;
+    }
+    // RuntimeSession::load_scene takes workspace-relative paths, so absolute
+    // --world inputs are normalized against the current directory.
+    let scene_path = match world_path {
+        Some(world_path) => {
+            let path = PathBuf::from(&world_path);
+            if path.is_absolute() {
+                let cwd = std::env::current_dir()?;
+                let relative = path.strip_prefix(&cwd).map_err(|_| {
+                    anyhow::anyhow!("--world paths must stay inside the current workspace")
+                })?;
+                Some(relative.to_string_lossy().into_owned())
+            } else {
+                Some(world_path)
+            }
+        }
+        None => Some(
+            if scene == "3d" {
+                "testing/assets/benchmark-3d.mnsc"
+            } else {
+                "testing/assets/benchmark-2d.mnsc"
+            }
+            .to_string(),
+        ),
+    };
+    let event_loop = EventLoop::new().context("could not create the window event loop")?;
+    event_loop.set_control_flow(ControlFlow::Poll);
+    let session = bootstrap::client_session(scene_path.as_deref(), profile, hot_reload)?;
+    let mut app = ClientApp::new(session, frame_limit, benchmark, warmup_frames)?;
     event_loop
         .run_app(&mut app)
         .context("the window event loop failed")?;
@@ -214,7 +227,8 @@ fn run_internal(args: Vec<String>, profile_override: Option<Profile>) -> anyhow:
         )?;
         write_report(&preparation_report, &preparation_output)?;
         let render = app
-            .host
+            .session
+            .host_mut()
             .render_api_mut(CORE_RENDER)
             .expect("render plugin is registered");
         let gpu_samples = render.take_gpu_samples();
@@ -274,13 +288,17 @@ fn run_internal(args: Vec<String>, profile_override: Option<Profile>) -> anyhow:
         }));
     }
     let loaded_mesh_vertices = app
-        .host
+        .session
+        .host_mut()
         .render_api_mut(CORE_RENDER)
         .map_or(0, |render| render.loaded_mesh_vertices());
-    let simulation_plugin = app.simulation_handle.as_ref().map(PluginHandle::id);
-    if let Some(handle) = app.simulation_handle.take() {
-        handle.dispose(&mut app.host)?;
-    }
+    let simulation_plugin = if app.session.host_mut().has_plugin(CORE_SIMULATION) {
+        // Exercise the real plugin unload path on exit, as before.
+        app.session.host_mut().unregister(CORE_SIMULATION)?;
+        Some(CORE_SIMULATION)
+    } else {
+        None
+    };
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -288,8 +306,8 @@ fn run_internal(args: Vec<String>, profile_override: Option<Profile>) -> anyhow:
             "scene": scene,
             "simulationPlugin": simulation_plugin,
             "frames": app.rendered_frames,
-            "tick": app.host.world().tick,
-            "entities": app.host.world().entities.len(),
+            "tick": app.session.world().tick,
+            "entities": app.session.world().entities.len(),
             "loadedMeshVertices": loaded_mesh_vertices,
             "benchmark": benchmark_result,
         }))?
@@ -298,9 +316,7 @@ fn run_internal(args: Vec<String>, profile_override: Option<Profile>) -> anyhow:
 }
 
 struct ClientApp {
-    host: PluginHost,
-    profile: Profile,
-    simulation_handle: Option<PluginHandle>,
+    session: RuntimeSession,
     window: Option<Arc<Window>>,
     last_update: Instant,
     accumulator_seconds: f64,
@@ -308,7 +324,6 @@ struct ClientApp {
     rendered_frames: u64,
     collect_benchmark: bool,
     warmup_frames: u64,
-    hot_reload: bool,
     frame_samples: Vec<f64>,
     preparation_samples: Vec<f64>,
     title_state: Option<(u64, usize, usize)>,
@@ -317,30 +332,18 @@ struct ClientApp {
 
 impl ClientApp {
     fn new(
-        engine: Engine,
+        session: RuntimeSession,
         frame_limit: u64,
         collect_benchmark: bool,
         warmup_frames: u64,
-        profile: Profile,
-        hot_reload: bool,
     ) -> anyhow::Result<Self> {
-        let mut host = PluginHost::new(engine);
-        let patched = profile
-            .clone()
-            .with_patch("core.render", false)
-            .with_patch("core.fbx", false);
-        let simulation_handle = bootstrap::instantiate(&patched, &mut host, None, false, false)?
-            .into_iter()
-            .find(|handle| handle.id() == SimulationPlugin::ID);
         let sample_capacity = if collect_benchmark {
             (frame_limit - warmup_frames) as usize
         } else {
             0
         };
         Ok(Self {
-            host,
-            profile,
-            simulation_handle,
+            session,
             window: None,
             last_update: Instant::now(),
             accumulator_seconds: 0.0,
@@ -348,12 +351,23 @@ impl ClientApp {
             rendered_frames: 0,
             collect_benchmark,
             warmup_frames,
-            hot_reload,
             frame_samples: Vec::with_capacity(sample_capacity),
             preparation_samples: Vec::with_capacity(sample_capacity),
             title_state: None,
             failure: None,
         })
+    }
+
+    /// Starts the render plugin that registered during `client_session`; the
+    /// window must already be attached, then the Startup stage runs the
+    /// renderer's startup system.
+    fn start_render(&mut self) -> anyhow::Result<()> {
+        self.session.host_mut().start_plugin(CORE_RENDER)?;
+        self.session
+            .host_mut()
+            .run_stage(SystemStage::Startup)
+            .map_err(anyhow::Error::new)?;
+        Ok(())
     }
 
     fn advance_simulation(&mut self) -> anyhow::Result<()> {
@@ -362,15 +376,15 @@ impl ClientApp {
         self.last_update = now;
         self.accumulator_seconds += elapsed;
 
-        let tick_seconds = 1.0 / f64::from(self.host.world().tick_rate);
+        let tick_seconds = 1.0 / f64::from(self.session.world().tick_rate);
         let steps = (self.accumulator_seconds / tick_seconds).floor() as u64;
         if steps == 0 {
             return Ok(());
         }
         let applied_steps = steps.min(5);
-        for _ in 0..applied_steps {
-            self.host.run_stage(SystemStage::FixedUpdate)?;
-        }
+        // Ticks go through the session so plugin scheduling, revisions, and
+        // event semantics match the agent control path exactly.
+        self.session.step(applied_steps)?;
         if steps > applied_steps {
             self.accumulator_seconds = 0.0;
         } else {
@@ -385,7 +399,7 @@ impl ApplicationHandler for ClientApp {
         if self.window.is_some() {
             return;
         }
-        let viewport = &self.host.world().viewport;
+        let viewport = &self.session.world().viewport;
         let attributes = Window::default_attributes()
             .with_title("Moni Engine")
             .with_inner_size(winit::dpi::LogicalSize::new(
@@ -395,19 +409,20 @@ impl ApplicationHandler for ClientApp {
         match event_loop.create_window(attributes) {
             Ok(window) => {
                 let window = Arc::new(window);
-                let patched = self.profile.clone().with_patch("core.simulation", false);
-                let result = bootstrap::instantiate(
-                    &patched,
-                    &mut self.host,
-                    Some(Arc::clone(&window)),
-                    self.collect_benchmark,
-                    self.hot_reload,
-                )
-                .and_then(|_| {
-                    self.host
-                        .run_stage(SystemStage::Startup)
-                        .map_err(anyhow::Error::new)
-                });
+                // Two-phase startup: the render plugin registered headlessly
+                // during client_session; attach the surface and start it now.
+                let result = if self.session.host_mut().has_plugin(CORE_RENDER) {
+                    if let Some(render) = self
+                        .session
+                        .host_mut()
+                        .plugin_mut::<RenderPlugin>(CORE_RENDER)
+                    {
+                        render.set_window(Arc::clone(&window));
+                    }
+                    self.start_render()
+                } else {
+                    Ok(())
+                };
                 match result {
                     Ok(()) => {
                         self.window = Some(window);
@@ -448,7 +463,7 @@ impl ApplicationHandler for ClientApp {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
-                self.host.resize(size.width, size.height);
+                self.session.host_mut().resize(size.width, size.height);
                 window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
@@ -457,10 +472,10 @@ impl ApplicationHandler for ClientApp {
                     event_loop.exit();
                     return;
                 }
-                let events = self.host.take_events();
+                let events = self.session.host_mut().take_events();
                 let title_state = (
-                    self.host.world().tick,
-                    self.host.world().entities.len(),
+                    self.session.world().tick,
+                    self.session.world().entities.len(),
                     events.len(),
                 );
                 if self.title_state != Some(title_state) {
@@ -471,8 +486,8 @@ impl ApplicationHandler for ClientApp {
                     ));
                 }
                 let started = self.collect_benchmark.then(Instant::now);
-                match self.host.run_stage(SystemStage::Render) {
-                    Ok(()) => match self.host.last_render_status() {
+                match self.session.host_mut().run_stage(SystemStage::Render) {
+                    Ok(()) => match self.session.host_mut().last_render_status() {
                         Some(RenderStatus::Rendered) => {
                             self.rendered_frames += 1;
                             if let Some(started) = started
@@ -481,7 +496,8 @@ impl ApplicationHandler for ClientApp {
                                 self.frame_samples
                                     .push(started.elapsed().as_secs_f64() * 1_000.0);
                                 let preparation = self
-                                    .host
+                                    .session
+                                    .host_mut()
                                     .render_api_mut(CORE_RENDER)
                                     .expect("render plugin is registered")
                                     .last_preparation_time();
@@ -495,7 +511,7 @@ impl ApplicationHandler for ClientApp {
                         Some(RenderStatus::Skip) => {}
                         Some(RenderStatus::Reconfigure) => {
                             let size = window.inner_size();
-                            self.host.resize(size.width, size.height);
+                            self.session.host_mut().resize(size.width, size.height);
                         }
                         None => {}
                     },

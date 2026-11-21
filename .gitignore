@@ -1,5 +1,7 @@
-# Rust
+# Rust (root and member crates each hold a target dir)
 /target
+/crates/*/target
+/plugins/**/target
 
 # Node.js
 /node_modules

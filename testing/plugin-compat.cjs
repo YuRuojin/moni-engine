@@ -34,6 +34,19 @@ verify("capabilities-and-static-api", () => {
   if (capabilities.profiles.pluginApiVersion !== 1 || capabilities.host.maxSystemTasks !== 1024 || capabilities.world.assets.queueCapacity !== 64 || !capabilities.components["core.model"]) {
     throw new Error("capability contract mismatch");
   }
+  // Commands are generated from the descriptor table: every entry carries
+  // the transaction flags and owner, and the registry events are listed.
+  const spawn = capabilities.commands.spawn;
+  if (spawn.owner !== "core" || spawn.mutatesWorld !== true || spawn.batch !== true || spawn.dryRun !== true || spawn.sideEffects.file !== false) {
+    throw new Error("generated built-in command metadata missing");
+  }
+  const save = capabilities.commands.save;
+  if (save.batch !== false || save.sideEffects.file !== true) {
+    throw new Error("non-batchable file commands lost their flags");
+  }
+  for (const event of ["component_registered", "component_unregistered"]) {
+    if (!capabilities.events.includes(event)) throw new Error(`missing ${event} event`);
+  }
 });
 
 verify("profile-dependency-order", () => {

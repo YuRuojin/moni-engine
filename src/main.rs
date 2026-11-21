@@ -13,7 +13,7 @@ use std::sync::Arc;
 use anyhow::{Context as AnyhowContext, bail};
 use moni_assets::{cooked, fbx};
 use moni_core::engine::Engine;
-use moni_core::host::{CORE_RENDER, CORE_SIMULATION, PluginHost, SystemStage};
+use moni_core::host::{CORE_RENDER, CORE_SIMULATION};
 use moni_core::profile::{self, Profile};
 use moni_core::{project, protocol, scene, workspace_path};
 use moni_script::QuickJsScriptRuntime;
@@ -73,7 +73,7 @@ fn print_help() -> anyhow::Result<()> {
   new PATH                  Create an independent game repository\n  run [--frames N]          Build and run the project in the current directory\n  doctor [--update-lock] [--rollback-lock] [--accept-permissions]
                             Validate project, scene, profile, and lockfile\n  fuzz [--target cooked|scene|fbx] [--iterations N] [--seed S]
                             Structured in-process parser fuzzing
-  capabilities              Print the machine-readable control schema\n  serve                     Serve NDJSON requests on stdin/stdout\n  headless [--profile NAME] [--scene PATH]\n                            Resolve and inspect a headless profile\n  profile [list|dump] [--profile NAME] [--patch ID=on|off] [--plugin-config ID=JSON]\n                            Inspect profiles and effective plugin trees\n  client [--scene 2d|3d] [--script PATH] [--frames N]\n         [--benchmark --warmup N --output PATH] [--hot-reload]\n                            Open the winit/wgpu client\n  editor [--scene PATH] [--frames N] [--hot-reload]\n                            Open the read-only .mnsc scene viewer\n  scene PATH [--output PATH] [--name NAME]\n                            Migrate and round-trip a .mnsc scene\n  benchmark [--scene 2d|3d] [--script PATH] [--frames N]\n            [--warmup N] [--output PATH]\n                            Measure release simulation ticks\n  demo [--ticks N] [--output PATH] [--snapshot PATH] [--script PATH]\n\nScript workflow:\n  npm install\n  npm run build\n  cargo run -- client\n  cargo run -- client --scene 3d\n  npm run benchmark"
+  capabilities              Print the machine-readable control schema\n  serve                     Serve NDJSON requests on stdin/stdout\n  headless [--profile NAME] [--scene PATH]\n                            Resolve and inspect a headless profile\n  profile [list|dump] [--profile NAME] [--patch ID=on|off] [--plugin-config ID=JSON]\n                            Inspect profiles and effective plugin trees\n  client [--scene 2d|3d] [--script PATH] [--frames N]\n         [--benchmark --warmup N --output PATH] [--hot-reload]\n                            Open the winit/wgpu client\n  editor [--scene PATH] [--frames N] [--hot-reload]\n                            Open the editable .mnsc scene editor (hierarchy + inspector)\n  scene PATH [--output PATH] [--name NAME]\n                            Migrate and round-trip a .mnsc scene\n  benchmark [--scene 2d|3d] [--script PATH] [--frames N]\n            [--warmup N] [--output PATH]\n                            Measure release simulation ticks\n  demo [--ticks N] [--output PATH] [--snapshot PATH] [--script PATH]\n\nScript workflow:\n  npm install\n  npm run build\n  cargo run -- client\n  cargo run -- client --scene 3d\n  npm run benchmark"
     );
     Ok(())
 }
@@ -82,15 +82,17 @@ fn serve() -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
-    let mut engine = Engine::new();
-    engine.set_script_runtime(Box::new(QuickJsScriptRuntime::new()));
+    // The agent path runs through the same RuntimeSession as the windowed
+    // client and editor: profile resolution, plugin lifecycle, script
+    // runtime, revisions, and event sequencing all apply.
+    let mut session = bootstrap::serve_session()?;
 
     for line in stdin.lock().lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        let (response, quit) = protocol::handle_line(&mut engine, &line);
+        let (response, quit) = session.handle_line(&line);
         writeln!(output, "{}", serde_json::to_string(&response)?)?;
         output.flush()?;
         if quit {
@@ -371,16 +373,15 @@ fn headless(args: Vec<String>) -> anyhow::Result<()> {
         }
         index += 1;
     }
-    let world = scene::load_scene(&workspace_path(&scene_path)?)?;
-    let mut engine = Engine::new();
-    engine.load_world(world)?;
-    let mut host = PluginHost::new(engine);
-    let profile = Profile::named(&profile_name)?;
-    let effective = profile.resolve(&moni_core::profile::Target::current())?;
-    bootstrap::instantiate(&profile, &mut host, None, false, false)?;
-    host.run_stage(SystemStage::Startup)?;
-    let gpu_initialized = host.has_plugin(CORE_RENDER);
-    let quickjs_initialized = host.has_plugin(CORE_SIMULATION) || host.script_host_count() != 0;
+    // Registration phase only: even a non-empty profile never starts runtime
+    // providers here. The headless profile is empty, so has_plugin checks
+    // below keep their original meaning.
+    let mut session = bootstrap::headless_session(&profile_name, &scene_path)?;
+    let effective =
+        Profile::named(&profile_name)?.resolve(&moni_core::profile::Target::current())?;
+    let gpu_initialized = session.host_mut().has_plugin(CORE_RENDER);
+    let quickjs_initialized = session.host_mut().has_plugin(CORE_SIMULATION)
+        || session.host_mut().script_host_count() != 0;
     if gpu_initialized || quickjs_initialized {
         bail!("headless profile initialized a forbidden runtime provider");
     }
@@ -389,7 +390,7 @@ fn headless(args: Vec<String>) -> anyhow::Result<()> {
         serde_json::to_string_pretty(&json!({
             "ok": true,
             "profile": profile_name,
-            "entities": host.world().entities.len(),
+            "entities": session.world().entities.len(),
             "gpuInitialized": gpu_initialized,
             "quickjsInitialized": quickjs_initialized,
             "fbxLoaded": false,
@@ -477,12 +478,13 @@ fn profile_command(args: Vec<String>) -> anyhow::Result<()> {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
-                "profiles": ["minimal", "default", "headless", "editor"],
+                "profiles": ["minimal", "default", "headless", "editor", "serve"],
                 "bundles": {
                     "minimal": [],
                     "default": ["core.simulation", "core.render", "core.fbx"],
                     "headless": [],
-                    "editor": ["core.render", "core.fbx", "core.editor"]
+                    "editor": ["core.render", "core.fbx", "core.editor"],
+                    "serve": ["core.simulation"]
                 }
             }))?
         );
@@ -509,10 +511,15 @@ fn profile_command(args: Vec<String>) -> anyhow::Result<()> {
 fn editor_command() -> anyhow::Result<()> {
     moni_editor::run(
         env::args().skip(2).collect(),
-        Box::new(|host, window, hot_reload| {
-            let profile = Profile::named("editor").map_err(|error| anyhow::anyhow!("{error}"))?;
-            bootstrap::instantiate(&profile, host, Some(Arc::clone(window)), true, hot_reload)?;
-            host.run_stage(SystemStage::Startup)?;
+        Box::new(|session, window, hot_reload| {
+            // Registration phase only, with the window attached to the render
+            // plugin: scene loading and render startup stay inside the editor
+            // so they run after its event loop has a surface.
+            let profile = Profile::named("editor")?.with_config(
+                "core.render",
+                json!({ "collectGpuTimestamps": true, "hotReload": hot_reload }),
+            );
+            bootstrap::register_profile(&profile, session.host_mut(), Some(Arc::clone(window)))?;
             Ok(())
         }),
     )
