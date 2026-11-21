@@ -49,7 +49,7 @@ pub struct PropertyField {
 }
 
 impl PropertyField {
-    fn new(name: &'static str, kind: PropertyType, required: bool) -> Self {
+    pub fn new(name: &'static str, kind: PropertyType, required: bool) -> Self {
         Self {
             name,
             kind,
@@ -63,19 +63,29 @@ impl PropertyField {
         }
     }
 
-    fn default(mut self, value: Value) -> Self {
+    pub fn default(mut self, value: Value) -> Self {
         self.default = Some(value);
         self
     }
 
-    fn range(mut self, minimum: f64, maximum: f64) -> Self {
+    pub fn range(mut self, minimum: f64, maximum: f64) -> Self {
         self.minimum = Some(minimum);
         self.maximum = Some(maximum);
         self
     }
 
-    fn max_length(mut self, maximum: usize) -> Self {
+    pub fn max_length(mut self, maximum: usize) -> Self {
         self.max_length = Some(maximum);
+        self
+    }
+
+    pub fn label(mut self, label: &'static str) -> Self {
+        self.label = label;
+        self
+    }
+
+    pub fn description(mut self, description: &'static str) -> Self {
+        self.description = description;
         self
     }
 
@@ -190,6 +200,14 @@ pub struct PropertySchema {
 }
 
 impl PropertySchema {
+    pub fn new(label: &'static str, description: &'static str, fields: Vec<PropertyField>) -> Self {
+        Self {
+            label,
+            description,
+            fields,
+        }
+    }
+
     pub fn apply_defaults(&self, value: &mut Value) -> Result<(), String> {
         let object = value
             .as_object_mut()
@@ -253,26 +271,79 @@ impl PropertySchema {
     }
 }
 
+/// Typed value mapping for descriptors backed by the closed `ComponentValue`
+/// enum. Only core components carry one today; dynamic components keep their
+/// values as schema-validated JSON in `Entity.extensions`.
+#[derive(Clone, Copy)]
+struct ComponentValueMapping {
+    deserialize: fn(&Value) -> Result<ComponentValue, String>,
+    serialize: fn(&ComponentValue) -> Result<Value, String>,
+}
+
+impl std::fmt::Debug for ComponentValueMapping {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ComponentValueMapping(typed)")
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct ComponentDescriptor {
     pub id: &'static str,
     pub legacy_id: Option<&'static str>,
     pub owner: &'static str,
     pub version: u32,
     pub schema: PropertySchema,
-    deserialize: fn(&Value) -> Result<ComponentValue, String>,
-    serialize: fn(&ComponentValue) -> Result<Value, String>,
+    value: Option<ComponentValueMapping>,
 }
 
 impl ComponentDescriptor {
+    /// Creates a schema-only descriptor. Its instances are stored as JSON in
+    /// `Entity.extensions` and validated purely through `PropertySchema`
+    /// (defaults plus field checks); there is no typed value mapping.
+    pub fn dynamic(
+        id: &'static str,
+        legacy_id: Option<&'static str>,
+        owner: &'static str,
+        version: u32,
+        schema: PropertySchema,
+    ) -> Self {
+        Self {
+            id,
+            legacy_id,
+            owner,
+            version,
+            schema,
+            value: None,
+        }
+    }
+
+    /// True when the descriptor has no typed value mapping and its instances
+    /// live as JSON in `Entity.extensions`.
+    pub fn is_dynamic(&self) -> bool {
+        self.value.is_none()
+    }
+
     pub fn deserialize(&self, value: &Value) -> Result<ComponentValue, String> {
+        let mapping = self.value.as_ref().ok_or_else(|| {
+            format!(
+                "component '{}' is schema-only; its values stay as JSON in entity extensions",
+                self.id
+            )
+        })?;
         let mut value = value.clone();
         self.schema.apply_defaults(&mut value)?;
         self.schema.validate(&value)?;
-        (self.deserialize)(&value)
+        (mapping.deserialize)(&value)
     }
 
     pub fn serialize(&self, value: &ComponentValue) -> Result<Value, String> {
-        let value = (self.serialize)(value)?;
+        let mapping = self.value.as_ref().ok_or_else(|| {
+            format!(
+                "component '{}' is schema-only; its values stay as JSON in entity extensions",
+                self.id
+            )
+        })?;
+        let value = (mapping.serialize)(value)?;
         self.schema.validate(&value)?;
         Ok(value)
     }
@@ -288,7 +359,7 @@ impl ComponentDescriptor {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ComponentRegistry {
     components: BTreeMap<&'static str, ComponentDescriptor>,
     legacy_ids: BTreeMap<&'static str, &'static str>,
@@ -305,10 +376,16 @@ impl ComponentRegistry {
         if self.components.contains_key(descriptor.id) {
             return Err(format!("duplicate component ID '{}'", descriptor.id));
         }
+        // Validate every conflict BEFORE committing anything: an insert-then-
+        // check here would silently re-point an existing legacy alias at this
+        // component and leave the registry corrupted after the error.
         if let Some(legacy) = descriptor.legacy_id
-            && self.legacy_ids.insert(legacy, descriptor.id).is_some()
+            && self.legacy_ids.contains_key(legacy)
         {
             return Err(format!("duplicate legacy component ID '{legacy}'"));
+        }
+        if let Some(legacy) = descriptor.legacy_id {
+            self.legacy_ids.insert(legacy, descriptor.id);
         }
         self.components.insert(descriptor.id, descriptor);
         Ok(())
@@ -320,6 +397,17 @@ impl ComponentRegistry {
                 .get(id)
                 .and_then(|id| self.components.get(id))
         })
+    }
+
+    /// Removes a descriptor and any legacy aliases pointing at it. Callers
+    /// that operate on a live world must first ensure no entity still carries
+    /// the component; the engine enforces that on its unregister path.
+    pub fn unregister(&mut self, id: &str) -> Result<(), String> {
+        if self.components.remove(id).is_none() {
+            return Err(format!("component '{id}' is not registered"));
+        }
+        self.legacy_ids.retain(|_, target| *target != id);
+        Ok(())
     }
 
     pub fn agent_schemas(&self) -> Value {
@@ -341,17 +429,19 @@ impl ComponentRegistry {
                 "2D entity position and rotation",
                 &[number("x", 0.0), number("y", 0.0), number("rotation", 0.0)],
             ),
-            deserialize: |value| {
-                serde_json::from_value(value.clone())
-                    .map(ComponentValue::Transform)
-                    .map_err(|error| error.to_string())
-            },
-            serialize: |value| match value {
-                ComponentValue::Transform(value) => {
-                    serde_json::to_value(value).map_err(|error| error.to_string())
-                }
-                _ => Err("expected core.transform value".into()),
-            },
+            value: Some(ComponentValueMapping {
+                deserialize: |value| {
+                    serde_json::from_value(value.clone())
+                        .map(ComponentValue::Transform)
+                        .map_err(|error| error.to_string())
+                },
+                serialize: |value| match value {
+                    ComponentValue::Transform(value) => {
+                        serde_json::to_value(value).map_err(|error| error.to_string())
+                    }
+                    _ => Err("expected core.transform value".into()),
+                },
+            }),
         })
         .expect("register core.transform");
         self.register(ComponentDescriptor {
@@ -375,17 +465,19 @@ impl ComponentRegistry {
                     PropertyField::new("layer", PropertyType::Integer, false).default(json!(0)),
                 ],
             ),
-            deserialize: |value| {
-                serde_json::from_value(value.clone())
-                    .map(ComponentValue::Sprite)
-                    .map_err(|error| error.to_string())
-            },
-            serialize: |value| match value {
-                ComponentValue::Sprite(value) => {
-                    serde_json::to_value(value).map_err(|error| error.to_string())
-                }
-                _ => Err("expected core.sprite value".into()),
-            },
+            value: Some(ComponentValueMapping {
+                deserialize: |value| {
+                    serde_json::from_value(value.clone())
+                        .map(ComponentValue::Sprite)
+                        .map_err(|error| error.to_string())
+                },
+                serialize: |value| match value {
+                    ComponentValue::Sprite(value) => {
+                        serde_json::to_value(value).map_err(|error| error.to_string())
+                    }
+                    _ => Err("expected core.sprite value".into()),
+                },
+            }),
         })
         .expect("register core.sprite");
         self.register(ComponentDescriptor {
@@ -410,17 +502,19 @@ impl ComponentRegistry {
                     number("roughness", 0.5).range(0.0, 1.0),
                 ],
             ),
-            deserialize: |value| {
-                serde_json::from_value(value.clone())
-                    .map(ComponentValue::Model)
-                    .map_err(|error| error.to_string())
-            },
-            serialize: |value| match value {
-                ComponentValue::Model(value) => {
-                    serde_json::to_value(value).map_err(|error| error.to_string())
-                }
-                _ => Err("expected core.model value".into()),
-            },
+            value: Some(ComponentValueMapping {
+                deserialize: |value| {
+                    serde_json::from_value(value.clone())
+                        .map(ComponentValue::Model)
+                        .map_err(|error| error.to_string())
+                },
+                serialize: |value| match value {
+                    ComponentValue::Model(value) => {
+                        serde_json::to_value(value).map_err(|error| error.to_string())
+                    }
+                    _ => Err("expected core.model value".into()),
+                },
+            }),
         })
         .expect("register core.model");
         self.register(ComponentDescriptor {
@@ -437,20 +531,22 @@ impl ComponentRegistry {
                         .max_length(256 * 1024),
                 ],
             ),
-            deserialize: |value| {
-                let script: ScriptComponent =
-                    serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
-                if script.source.is_some() == script.inline.is_some() {
-                    return Err("script requires exactly one of source or inline".into());
-                }
-                Ok(ComponentValue::Script(script))
-            },
-            serialize: |value| match value {
-                ComponentValue::Script(value) => {
-                    serde_json::to_value(value).map_err(|error| error.to_string())
-                }
-                _ => Err("expected core.script value".into()),
-            },
+            value: Some(ComponentValueMapping {
+                deserialize: |value| {
+                    let script: ScriptComponent =
+                        serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
+                    if script.source.is_some() == script.inline.is_some() {
+                        return Err("script requires exactly one of source or inline".into());
+                    }
+                    Ok(ComponentValue::Script(script))
+                },
+                serialize: |value| match value {
+                    ComponentValue::Script(value) => {
+                        serde_json::to_value(value).map_err(|error| error.to_string())
+                    }
+                    _ => Err("expected core.script value".into()),
+                },
+            }),
         })
         .expect("register core.script");
     }
@@ -478,6 +574,40 @@ mod tests {
 
     fn path_field() -> PropertyField {
         PropertyField::new("source", PropertyType::Path, false)
+    }
+
+    /// A conflicting legacy alias must be rejected WITHOUT corrupting the
+    /// registry: the previous mapping has to keep resolving to its original
+    /// owner after the failed registration.
+    #[test]
+    fn conflicting_legacy_alias_is_rejected_without_repointing() {
+        let mut registry = ComponentRegistry::new();
+        registry
+            .register(ComponentDescriptor::dynamic(
+                "game.one",
+                Some("game.legacy"),
+                "game.plugin",
+                1,
+                PropertySchema::new("One", "first", vec![]),
+            ))
+            .expect("first registration");
+
+        let error = registry
+            .register(ComponentDescriptor::dynamic(
+                "game.two",
+                Some("game.legacy"),
+                "game.plugin",
+                1,
+                PropertySchema::new("Two", "second", vec![]),
+            ))
+            .expect_err("duplicate legacy alias must fail");
+        assert!(error.contains("game.legacy"));
+
+        assert!(
+            matches!(registry.resolve("game.legacy"), Some(descriptor) if descriptor.id == "game.one"),
+            "the original alias mapping must survive the failed registration"
+        );
+        assert!(registry.resolve("game.two").is_none());
     }
 
     #[test]
@@ -526,5 +656,63 @@ mod tests {
             }
             other => panic!("unexpected component value {other:?}"),
         }
+    }
+
+    fn health_descriptor() -> ComponentDescriptor {
+        ComponentDescriptor::dynamic(
+            "game.health",
+            None,
+            "game.test",
+            1,
+            PropertySchema::new(
+                "Health",
+                "Dynamic test component",
+                vec![
+                    PropertyField::new("hp", PropertyType::Number, false)
+                        .default(json!(100))
+                        .range(0.0, 1000.0)
+                        .label("Hit points")
+                        .description("Current hit points"),
+                    PropertyField::new("max_hp", PropertyType::Number, false)
+                        .default(json!(100))
+                        .range(0.0, 1000.0),
+                ],
+            ),
+        )
+    }
+
+    #[test]
+    fn dynamic_descriptors_register_and_resolve() {
+        let mut registry = ComponentRegistry::new();
+        registry.register(health_descriptor()).expect("register");
+        let descriptor = registry.resolve("game.health").expect("resolved");
+        assert!(descriptor.is_dynamic());
+        assert_eq!(descriptor.owner, "game.test");
+        assert_eq!(descriptor.version, 1);
+        let schema = descriptor.agent_schema();
+        assert_eq!(schema["x-component"]["owner"], json!("game.test"));
+        assert_eq!(schema["properties"]["hp"]["default"], json!(100));
+        assert!(
+            registry.register(health_descriptor()).is_err(),
+            "duplicate dynamic ID is rejected"
+        );
+    }
+
+    #[test]
+    fn dynamic_descriptors_stay_json_and_unregister() {
+        let mut registry = ComponentRegistry::new();
+        registry.register(health_descriptor()).expect("register");
+        let descriptor = registry.resolve("game.health").expect("resolved");
+        let error = descriptor
+            .deserialize(&json!({}))
+            .expect_err("schema-only components have no typed value mapping");
+        assert!(error.contains("schema-only"), "unexpected error: {error}");
+        registry.unregister("game.health").expect("unregister");
+        assert!(registry.resolve("game.health").is_none());
+        assert!(registry.unregister("game.health").is_err());
+        assert!(
+            registry.resolve("core.sprite").is_some(),
+            "unregister does not disturb core components"
+        );
     }
 }

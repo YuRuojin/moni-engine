@@ -15,6 +15,15 @@ use crate::scene3d::{Camera3d, Light};
 pub const SCENE_FORMAT: &str = "moni-scene";
 pub const SCENE_VERSION: u32 = 2;
 
+/// Scene root extension key holding the world-level component version table:
+/// dynamic component id -> schema version the scene data was written at.
+/// Written by [`save_scene_with_registry`] and consumed by the session's
+/// registry-validated load, which rebuilds a live-world table that keeps
+/// unregistered and future-version entries (see
+/// `session::retain_component_versions`); per-entity component logic must
+/// skip this key.
+pub const COMPONENT_VERSIONS_KEY: &str = "moni.componentVersions";
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SceneFile {
@@ -146,24 +155,74 @@ pub fn validate_scene_file(path: &Path) -> anyhow::Result<usize> {
 
 pub fn save_scene(world: &World, name: &str, path: &Path) -> anyhow::Result<()> {
     let value = scene_value(world, name)?;
+    write_scene_value(&value, path)
+}
+
+/// Registry-aware save: identical to [`save_scene`] except the scene root
+/// extensions carry the [`COMPONENT_VERSIONS_KEY`] table (used dynamic
+/// component id -> version). The live `world` is never mutated; the table is
+/// rebuilt per actual content via [`collect_component_versions`]: components
+/// with a retained live-world entry (unregistered or future-version data)
+/// keep that version, everything else records the registry's current
+/// version, and the key disappears when no entry remains. Versions reflect
+/// the registry's current schema, matching the load-side rule that
+/// migrated/validated data sits at the registry version.
+pub fn save_scene_with_registry(
+    world: &World,
+    name: &str,
+    path: &Path,
+    registry: &ComponentRegistry,
+) -> anyhow::Result<()> {
+    let value = scene_value_with_registry(world, name, registry)?;
+    write_scene_value(&value, path)
+}
+
+fn write_scene_value(value: &Value, path: &Path) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, serde_json::to_string_pretty(&value)?)?;
+    fs::write(path, serde_json::to_string_pretty(value)?)?;
     Ok(())
 }
 
 pub fn scene_value(world: &World, name: &str) -> anyhow::Result<Value> {
+    scene_value_inner(world, name, None)
+}
+
+/// Like [`scene_value`] but rebuilds the [`COMPONENT_VERSIONS_KEY`] table
+/// from actual content (see [`save_scene_with_registry`]).
+pub fn scene_value_with_registry(
+    world: &World,
+    name: &str,
+    registry: &ComponentRegistry,
+) -> anyhow::Result<Value> {
+    scene_value_inner(world, name, Some(registry))
+}
+
+fn scene_value_inner(
+    world: &World,
+    name: &str,
+    version_registry: Option<&ComponentRegistry>,
+) -> anyhow::Result<Value> {
     if name.trim().is_empty() {
         bail!("scene name must not be empty");
     }
-    let registry = ComponentRegistry::new();
+    let core_registry = ComponentRegistry::new();
+    let registry = version_registry.unwrap_or(&core_registry);
     let mut extensions = world.extensions.clone();
     if !world.asset_aliases.is_empty() {
         extensions.insert(
             "res".to_string(),
             serde_json::to_value(&world.asset_aliases)?,
         );
+    }
+    if let Some(version_registry) = version_registry {
+        let versions = collect_component_versions(world, version_registry);
+        if versions.is_empty() {
+            extensions.remove(COMPONENT_VERSIONS_KEY);
+        } else {
+            extensions.insert(COMPONENT_VERSIONS_KEY.to_string(), Value::Object(versions));
+        }
     }
     let mut entities = Vec::new();
     for entity in world.entities.values() {
@@ -226,6 +285,47 @@ pub fn scene_value(world: &World, name: &str) -> anyhow::Result<Value> {
         extensions,
         entities,
     })?)
+}
+
+/// Dynamic component id -> version for the scene version table, as a JSON
+/// object mirroring actual content:
+///
+/// - a dynamic component in use keeps the world's retained entry when one
+///   survives the session load (unregistered-at-load or future-version
+///   data); otherwise it records the registry's current version;
+/// - an unregistered component keeps a retained entry verbatim (the
+///   registry does not know its version) and gains no entry without one;
+/// - retained entries whose component no longer appears on any entity are
+///   dropped, and unused components never gain an entry.
+fn collect_component_versions(
+    world: &World,
+    registry: &ComponentRegistry,
+) -> serde_json::Map<String, Value> {
+    let retained = world
+        .extensions
+        .get(COMPONENT_VERSIONS_KEY)
+        .and_then(Value::as_object);
+    let mut versions: BTreeMap<String, Value> = BTreeMap::new();
+    for entity in world.entities.values() {
+        for id in entity.extensions.keys() {
+            if let Some(descriptor) = registry.resolve(id) {
+                if descriptor.is_dynamic() {
+                    let version = retained
+                        .and_then(|table| table.get(id.as_str()))
+                        .and_then(Value::as_u64)
+                        .filter(|version| *version <= u64::from(u32::MAX))
+                        .map(|version| version as u32)
+                        .unwrap_or(descriptor.version);
+                    versions.insert(id.to_string(), json!(version));
+                }
+            } else if let Some(version) = retained.and_then(|table| table.get(id.as_str())) {
+                versions.insert(id.to_string(), version.clone());
+            }
+        }
+    }
+    versions
+        .into_iter()
+        .collect::<serde_json::Map<String, Value>>()
 }
 
 pub fn migrate_scene(mut value: Value) -> anyhow::Result<Value> {
@@ -402,7 +502,164 @@ fn load_script(component: ScriptComponent) -> anyhow::Result<ScriptState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::{ComponentDescriptor, PropertyField, PropertySchema, PropertyType};
+    use crate::engine::{Entity, Transform};
     use serde_json::json;
+
+    fn health_descriptor() -> ComponentDescriptor {
+        ComponentDescriptor::dynamic(
+            "game.health",
+            None,
+            "game.test",
+            2,
+            PropertySchema::new(
+                "Health",
+                "Dynamic test component",
+                vec![
+                    PropertyField::new("hp", PropertyType::Number, false)
+                        .default(json!(100))
+                        .range(0.0, 1000.0),
+                ],
+            ),
+        )
+    }
+
+    fn world_with_entity(component_id: &str, value: Value) -> World {
+        let mut world = World::default();
+        let mut extensions = BTreeMap::new();
+        extensions.insert(component_id.to_string(), value);
+        world.entities.insert(
+            1,
+            Entity {
+                id: 1,
+                name: "a".into(),
+                transform: Transform::default(),
+                sprite: None,
+                model: None,
+                script: None,
+                extensions,
+            },
+        );
+        world.next_entity_id = 2;
+        world
+    }
+
+    #[test]
+    fn registry_aware_save_writes_component_versions_for_used_components() {
+        let mut registry = ComponentRegistry::new();
+        registry.register(health_descriptor()).expect("register");
+        let world = world_with_entity("game.health", json!({ "hp": 10 }));
+        let value = scene_value_with_registry(&world, "versions", &registry).expect("scene value");
+        assert_eq!(
+            value["extensions"][COMPONENT_VERSIONS_KEY]["game.health"],
+            json!(2),
+            "the used dynamic component records its registry version"
+        );
+    }
+
+    #[test]
+    fn registry_aware_save_omits_the_version_table_when_unused() {
+        let mut registry = ComponentRegistry::new();
+        registry.register(health_descriptor()).expect("register");
+        let mut world = World::default();
+        // A stale table carried through a round trip must not survive a
+        // registry-aware save when no dynamic component is used anymore.
+        world
+            .extensions
+            .insert(COMPONENT_VERSIONS_KEY.to_string(), json!({ "gone": 1 }));
+        let value = scene_value_with_registry(&world, "plain", &registry).expect("scene value");
+        assert!(
+            value["extensions"].get(COMPONENT_VERSIONS_KEY).is_none(),
+            "no used dynamic components means no version table: {}",
+            value["extensions"]
+        );
+        // Unregistered keys without a retained entry never get one either.
+        let world = world_with_entity("vendor.custom", json!({ "kept": true }));
+        let value = scene_value_with_registry(&world, "vendor", &registry).expect("scene value");
+        assert!(
+            value["extensions"].get(COMPONENT_VERSIONS_KEY).is_none(),
+            "unregistered component keys are outside the version table"
+        );
+    }
+
+    #[test]
+    fn registry_aware_save_keeps_retained_versions_for_live_data() {
+        let mut registry = ComponentRegistry::new();
+        registry.register(health_descriptor()).expect("register");
+        let mut world = world_with_entity("game.health", json!({ "hp": 55, "futureField": true }));
+        world.entities.insert(
+            2,
+            Entity {
+                id: 2,
+                name: "b".into(),
+                transform: Transform::default(),
+                sprite: None,
+                model: None,
+                script: None,
+                extensions: BTreeMap::from([(
+                    "vendor.custom".to_string(),
+                    json!({ "kept": true }),
+                )]),
+            },
+        );
+        world.next_entity_id = 3;
+        // Retained entries as the session load leaves them: a future version
+        // for the registered component and any version for the unregistered
+        // one.
+        world.extensions.insert(
+            COMPONENT_VERSIONS_KEY.to_string(),
+            json!({ "game.health": 9, "vendor.custom": 3 }),
+        );
+        let value = scene_value_with_registry(&world, "retained", &registry).expect("scene value");
+        assert_eq!(
+            value["extensions"][COMPONENT_VERSIONS_KEY]["game.health"],
+            json!(9),
+            "a retained future version wins over the registry version"
+        );
+        assert_eq!(
+            value["extensions"][COMPONENT_VERSIONS_KEY]["vendor.custom"],
+            json!(3),
+            "an unregistered component keeps its retained version"
+        );
+        assert_eq!(
+            value["entities"][0]["components"]["game.health"],
+            json!({ "hp": 55, "futureField": true }),
+            "future-version data is written verbatim"
+        );
+    }
+
+    #[test]
+    fn registry_aware_save_drops_retained_entries_without_live_data() {
+        let mut registry = ComponentRegistry::new();
+        registry.register(health_descriptor()).expect("register");
+        let mut world = world_with_entity("vendor.custom", json!({ "kept": true }));
+        world.extensions.insert(
+            COMPONENT_VERSIONS_KEY.to_string(),
+            json!({ "game.health": 9, "vendor.custom": 3, "game.gone": 5 }),
+        );
+        let value = scene_value_with_registry(&world, "drop", &registry).expect("scene value");
+        assert_eq!(
+            value["extensions"][COMPONENT_VERSIONS_KEY],
+            json!({ "vendor.custom": 3 }),
+            "entries without instances are dropped and the unused registered component gains no entry"
+        );
+    }
+
+    #[test]
+    fn plain_save_omits_the_version_table() {
+        let mut registry = ComponentRegistry::new();
+        registry.register(health_descriptor()).expect("register");
+        let world = world_with_entity("game.health", json!({ "hp": 10 }));
+        let value = scene_value(&world, "plain").expect("scene value");
+        assert!(
+            value["extensions"].get(COMPONENT_VERSIONS_KEY).is_none(),
+            "the registry-less save never injects the table"
+        );
+        let path =
+            std::env::temp_dir().join(format!("moni-plain-save-{}.mnsc", std::process::id()));
+        save_scene(&world, "plain", &path).expect("save scene");
+        fs::remove_file(&path).ok();
+    }
 
     #[test]
     fn load_reads_scene_asset_aliases() {

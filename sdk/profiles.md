@@ -53,6 +53,7 @@ patch 按声明顺序应用。除 `enabled` 开关外，patch 还可携带 `conf
 - `default`：`core.simulation`、`core.render`、`core.fbx`。
 - `headless`：空组合，不初始化窗口、GPU、QuickJS 或 FBX。
 - `editor`：`core.render`、`core.fbx`、`core.editor`，不启动 QuickJS。
+- `serve`：`core.simulation`，agent/CLI 控制路径使用；组合根在会话构造时安装 QuickJS 运行时。
 
 ## 实例化与裁剪边界
 

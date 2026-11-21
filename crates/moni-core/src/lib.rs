@@ -12,6 +12,7 @@ pub mod protocol;
 pub mod render;
 pub mod scene;
 pub mod scene3d;
+pub mod session;
 pub mod workspace;
 
 pub use workspace::workspace_path;

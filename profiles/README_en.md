@@ -11,7 +11,7 @@
 - **Patch**: replaces settings or inserts plugins by declaration identity without modifying bundle source.
 - **Launch adapter**: resolves a named profile and starts the host rather than implementing a separate hardcoded feature composition.
 
-Current static compositions are `minimal`, `default`, `editor`, and `headless`; `base`, `player`, and `server` remain future directions. Headless initializes no window, GPU, QuickJS, or FBX provider instead of maintaining another engine. See [`sdk/profiles_en.md`](../sdk/profiles_en.md) for the contract.
+Current static compositions are `minimal`, `default`, `editor`, `headless`, and `serve` (the agent/CLI control path, wiring `core.simulation`); `base`, `player`, and `server` remain future directions. Headless initializes no window, GPU, QuickJS, or FBX provider instead of maintaining another engine. See [`sdk/profiles_en.md`](../sdk/profiles_en.md) for the contract.
 
 ## Ordered overrides
 

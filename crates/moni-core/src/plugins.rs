@@ -89,13 +89,13 @@ impl Plugin for SimulationPlugin {
     fn start(&mut self, context: &mut PluginContext) -> Result<(), PluginError> {
         context.require("script.execute")?;
         if let Some(tick_rate) = self.tick_rate_override {
-            context.engine.world_mut().tick_rate = tick_rate;
+            context.world_mut()?.tick_rate = tick_rate;
         }
         Ok(())
     }
 
     fn stop(&mut self, context: &mut PluginContext) {
-        context.engine.shutdown_runtime();
+        context.shutdown_scripts();
     }
 
     fn execute(
@@ -106,14 +106,11 @@ impl Plugin for SimulationPlugin {
         match stage {
             SystemStage::FixedUpdate => {
                 context.require("script.execute")?;
-                context
-                    .engine
-                    .step(1)
-                    .map_err(|error| PluginError::new(error.message))?;
+                context.run_ticks(1)?;
                 Ok(PluginOutput::None)
             }
             SystemStage::Shutdown => {
-                context.engine.shutdown_runtime();
+                context.shutdown_scripts();
                 Ok(PluginOutput::None)
             }
             _ => Ok(PluginOutput::None),

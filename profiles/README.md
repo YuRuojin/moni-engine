@@ -11,7 +11,7 @@
 - **Patch**：按声明标识替换配置或插入插件，不修改 bundle 源码。
 - **启动适配器**：只解析命名 profile 并启动宿主，不实现另一条硬编码功能组合。
 
-当前静态组合包括 `minimal`、`default`、`editor` 和 `headless`。`base`、`player` 和 `server` 是后续组合方向。`headless` 不挂载窗口、GPU、QuickJS 或 FBX 提供方，而不是维护另一套引擎。详细契约见 [`sdk/profiles.md`](../sdk/profiles.md)。
+当前静态组合包括 `minimal`、`default`、`editor`、`headless` 和 `serve`（agent/CLI 控制路径，装配 `core.simulation`）。`base`、`player` 和 `server` 是后续组合方向。`headless` 不挂载窗口、GPU、QuickJS 或 FBX 提供方，而不是维护另一套引擎。详细契约见 [`sdk/profiles.md`](../sdk/profiles.md)。
 
 ## 有序覆盖
 

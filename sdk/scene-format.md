@@ -62,7 +62,41 @@ v2 使用带命名空间的组件 ID：
 }
 ```
 
-内置组件由 [`ComponentRegistry`](component-schema.md) 解析。未注册组件保留原始 JSON，不获得执行权限。
+内置组件由 [`ComponentRegistry`](component-schema.md) 解析。未注册组件保留原始 JSON，不获得执行权限。动态（schema-only）组件的版本声明与加载校验见下文"组件版本表"与"会话加载"。
+
+## 组件版本表
+
+根级 `extensions["moni.componentVersions"]` 声明世界级组件版本表：动态组件 ID → 场景数据写入时的 schema 版本。
+
+```json
+{
+  "extensions": {
+    "moni.componentVersions": {
+      "game.health": 1
+    }
+  }
+}
+```
+
+保存行为（registry 感知路径按实际内容重建该表，不改动内存中的世界）：
+
+- `save_scene_with_registry` / `scene_value_with_registry` 为每个仍被实体携带的动态（非 core）组件写入版本：若内存世界仍保留该组件的条目（未注册组件，或场景版本新于注册表的"未来版本"数据，见"会话加载"），沿用保留的版本；否则写入注册表当前版本。
+- 已无任何实体携带的组件条目被丢弃，未被使用的组件不产生条目（注册了但未使用的动态组件同样没有条目）；没有任何条目时省略该键。
+- 不带注册表的 `save_scene` / `scene_value` 不注入也不删除该表，扩展数据原样保留。
+
+`moni.componentVersions` 是保留键：只存在于场景根扩展，逐实体组件处理必须跳过它。
+
+## 会话加载（唯一场景加载路径）
+
+`RuntimeSession::load_scene`（GUI、CLI 与 agent 会话共用的唯一加载入口；路径为 workspace 相对）在 `scene::load_scene` 的语法与 core 校验之后、安装世界之前，用会话注册表校验动态组件：
+
+- 场景版本来自组件版本表；缺条目时按注册表当前版本处理，不做迁移。
+- 场景版本 < 注册表版本：先沿注册的迁移链升级，再应用 schema 默认值并做 schema 校验；迁移或校验失败返回 `invalid_component`，details 为 `{ entity, component, cause }`，当前世界、revision 与事件保持不变。
+- 场景版本 > 注册表版本：数据原样保留（不应用默认值、不校验），组件 ID 出现在结果的 `preservedFuture` 中，不报错。
+- 未注册的组件键原样保留。
+- 成功时执行 `engine.load_world` 并返回 `{ "loaded": true, "entities": n, "migrated": [组件ID...], "preservedFuture": [组件ID...] }`。
+- 成功加载在内存世界重建版本表：未注册组件（任意版本）与未来版本实例的条目原样保留，已迁移/校验到注册表当前版本的组件条目被消费（保存时按注册表重新生成），无实例的条目被丢弃；空表不安装。
+- 未来版本实例只读：只要仍有实体携带组件的未来版本实例，写入该组件的 `attach_component` 一律失败（`component_future_version`，details 为 `{ component, sceneVersion, registryVersion, futureInstances }`），世界保持不变；`remove_component` 移除未来实例是允许的（显式丢弃数据是唯一出路），移除最后一个未来实例时同步清除保留条目。之后的 registry 感知保存继续写出保留版本，插件安装后重新加载即沿迁移链升级。
 
 ## 灯光
 
@@ -106,8 +140,8 @@ v1 的 `transform`、`sprite`、`model`、`script` 分别迁移到 `core.transfo
 cargo run -- scene testing/assets/benchmark-3d.mnsc --output target/roundtrip.mnsc --name example
 ```
 
-该命令加载、校验并保存场景，可用于验证迁移、别名表和未知数据保留。可运行示例位于已入库的 `testing/assets/benchmark-2d.mnsc` 和 `testing/assets/benchmark-3d.mnsc`。
+该命令加载、校验并保存场景，可用于验证迁移、别名表和未知数据保留（包括组件版本表的原样保留）。可运行示例位于已入库的 `testing/assets/benchmark-2d.mnsc` 和 `testing/assets/benchmark-3d.mnsc`。
 
 ## 当前边界
 
-v2 不包含预制体继承、动态第三方组件执行、场景增量编辑或二进制编码。加载器位于 `src/scene.rs`，输出经过现有世界校验的 `World`；运行时快照与 `.mnsc` 仍是不同格式。
+v2 不包含预制体继承、动态第三方组件执行、场景增量编辑或二进制编码。加载器位于 `crates/moni-core/src/scene.rs`，输出经过现有世界校验的 `World`；带注册表校验的加载入口是 `RuntimeSession::load_scene`（见"会话加载"）。运行时快照与 `.mnsc` 仍是不同格式。

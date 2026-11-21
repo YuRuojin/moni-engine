@@ -260,6 +260,7 @@ impl Profile {
             "default" => vec!["default"],
             "headless" => vec!["headless"],
             "editor" => vec!["editor"],
+            "serve" => vec!["serve"],
             _ => return Err(PluginError::new(format!("unknown profile '{name}'"))),
         };
         Ok(Self {
@@ -523,6 +524,7 @@ fn static_bundle(name: &str) -> Result<&'static [&'static str], PluginError> {
         "minimal" | "headless" => Ok(&[]),
         "default" => Ok(&["core.simulation", "core.render", "core.fbx"]),
         "editor" => Ok(&["core.render", "core.fbx", "core.editor"]),
+        "serve" => Ok(&["core.simulation"]),
         _ => Err(PluginError::new(format!("unknown bundle '{name}'"))),
     }
 }

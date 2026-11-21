@@ -53,6 +53,7 @@ Patches apply in declaration order. Besides the `enabled` switch, a patch may ca
 - `default`: `core.simulation`, `core.render`, and `core.fbx`.
 - `headless`: empty composition with no window, GPU, QuickJS, or FBX initialization.
 - `editor`: `core.render`, `core.fbx`, and `core.editor`, without QuickJS.
+- `serve`: `core.simulation`, used by the agent/CLI control path; the composition root installs the QuickJS runtime when building the session.
 
 ## Instantiation and pruning boundary
 

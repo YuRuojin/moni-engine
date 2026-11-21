@@ -2,7 +2,7 @@
 
 [中文](security.md) | English
 
-`PermissionPolicy` in `src/host.rs` stores manifest-granted permissions by plugin ID. Plugins check permissions during startup and execution through `PluginContext`; unregister revokes them and shutdown clears them.
+`PermissionPolicy` in `crates/moni-core/src/host.rs` stores manifest-granted permissions by plugin ID. Plugins check permissions during startup and execution through `PluginContext`; unregister revokes them and shutdown clears them. Access declarations are likewise enforced by the host at runtime. Native static plugins are trusted code: permissions and access declarations serve intent, auditing, and dependency checks — they are not a sandbox against malicious or buggy plugins; untrusted importers, scripts, and tools need process or runtime isolation.
 
 ## Permission boundaries
 

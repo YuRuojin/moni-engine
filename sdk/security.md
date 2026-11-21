@@ -2,7 +2,7 @@
 
 中文 | [English](security_en.md)
 
-`src/host.rs` 的 `PermissionPolicy` 按插件 ID 保存清单授予的权限。插件在启动和执行阶段通过 `PluginContext` 检查权限，注销时撤销，关闭时清空。
+`crates/moni-core/src/host.rs` 的 `PermissionPolicy` 按插件 ID 保存清单授予的权限。插件在启动和执行阶段通过 `PluginContext` 检查权限，注销时撤销，关闭时清空。访问声明同样由宿主在运行时强制检查。原生静态插件是受信任代码：权限与访问声明服务于意图表达、审计和依赖检查，不是抵御恶意或有缺陷插件的沙箱；不可信导入器、脚本或工具需要进程或运行时级隔离。
 
 ## 权限边界
 

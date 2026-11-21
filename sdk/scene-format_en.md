@@ -62,7 +62,41 @@ v2 uses namespaced component IDs:
 }
 ```
 
-Built-in components are resolved by the [`ComponentRegistry`](component-schema_en.md). Unregistered components retain their original JSON without execution permission.
+Built-in components are resolved by the [`ComponentRegistry`](component-schema_en.md). Unregistered components retain their original JSON without execution permission. Version declaration and load-time validation for dynamic (schema-only) components are covered in "Component version table" and "Session loading" below.
+
+## Component version table
+
+The root-level `extensions["moni.componentVersions"]` declares the world-level component version table: dynamic component id -> the schema version the scene data was written at.
+
+```json
+{
+  "extensions": {
+    "moni.componentVersions": {
+      "game.health": 1
+    }
+  }
+}
+```
+
+Save behavior (the registry-aware path rebuilds the table from actual content and never mutates the in-memory world):
+
+- `save_scene_with_registry` / `scene_value_with_registry` write a version for every dynamic (non-core) component still carried by an entity: when the in-memory world retains an entry for it (an unregistered component, or "future-version" data whose scene version is newer than the registry's, see "Session loading"), the retained version is kept; otherwise the registry's current version is written.
+- Entries whose component is no longer carried by any entity are dropped, unused components gain no entry (including registered dynamic components that are not in use), and the key is omitted when no entries remain.
+- The registry-less `save_scene` / `scene_value` neither injects nor removes the table; extension data is preserved verbatim.
+
+`moni.componentVersions` is a reserved key: it only exists at the scene root, and per-entity component logic must skip it.
+
+## Session loading (the single scene-loading path)
+
+`RuntimeSession::load_scene` (the single loading entry shared by GUI, CLI, and agent sessions; the path is workspace-relative) validates dynamic components against the session registry after `scene::load_scene` syntax and core validation, and before the world is installed:
+
+- The scene version comes from the component version table; a missing entry means the data is treated as being at the registry's current version, with no migration.
+- Scene version < registry version: the value runs through the registered migrator chain first, then schema defaults and schema validation apply; a migration or validation failure returns `invalid_component` with details `{ entity, component, cause }`, and the current world, revision, and events stay untouched.
+- Scene version > registry version: the data is preserved verbatim (no defaults, no validation), the component id is listed under `preservedFuture` in the result, and no error is raised.
+- Unregistered component keys are preserved verbatim.
+- On success the session runs `engine.load_world` and returns `{ "loaded": true, "entities": n, "migrated": [component ids...], "preservedFuture": [component ids...] }`.
+- A successful load rebuilds the version table in the in-memory world: entries for unregistered components (any version) and for future-version instances are preserved verbatim, entries of components migrated/validated to the registry version are consumed (the save recomputes those), and entries without instances are dropped; an empty table is not installed.
+- Future-version instances are read-only: while any entity still carries a future-version instance of a component, `attach_component` writes for it fail with `component_future_version` (details `{ component, sceneVersion, registryVersion, futureInstances }`) and the world stays untouched; `remove_component` on a future instance is allowed (explicitly discarding the data is the way out), and removing the last future instance also drops the retained entry. Later registry-aware saves keep writing the retained version, and reloading after the plugin is installed migrates the data through the migrator chain.
 
 ## Lights
 
@@ -106,8 +140,8 @@ Root-level `extensions.res` declares the virtual asset alias table, mapping alia
 cargo run -- scene testing/assets/benchmark-3d.mnsc --output target/roundtrip.mnsc --name example
 ```
 
-This loads, validates, and saves a scene to verify migration, alias tables, and unknown-data preservation. Runnable examples are the committed `testing/assets/benchmark-2d.mnsc` and `testing/assets/benchmark-3d.mnsc`.
+This loads, validates, and saves a scene to verify migration, alias tables, and unknown-data preservation (including verbatim preservation of the component version table). Runnable examples are the committed `testing/assets/benchmark-2d.mnsc` and `testing/assets/benchmark-3d.mnsc`.
 
 ## Current boundaries
 
-v2 has no prefab inheritance, dynamic third-party component execution, incremental scene editing, or binary encoding. `src/scene.rs` converts it into a `World` validated by the existing engine; runtime snapshots and `.mnsc` remain different formats.
+v2 has no prefab inheritance, dynamic third-party component execution, incremental scene editing, or binary encoding. The loader lives in `crates/moni-core/src/scene.rs` and converts the file into a `World` validated by the existing engine; the registry-validated load entry is `RuntimeSession::load_scene` (see "Session loading"). Runtime snapshots and `.mnsc` remain different formats.
