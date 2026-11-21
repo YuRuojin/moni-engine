@@ -11,7 +11,9 @@ use std::path::PathBuf;
 use serde_json::{Value, json};
 
 use moni_core::components::{ComponentDescriptor, PropertyField, PropertySchema, PropertyType};
-use moni_core::engine::{Engine, Entity, EntitySpec, Transform, World};
+use moni_core::engine::{
+    Command, Engine, EngineError, Entity, EntitySpec, MAX_SCRIPT_BYTES, Transform, World,
+};
 use moni_core::host::{
     Plugin, PluginContext, PluginError, PluginOutput, PluginRegistry, SystemDescriptor, SystemStage,
 };
@@ -87,6 +89,23 @@ fn session_with_health(version: u32) -> RuntimeSession {
         .host_mut()
         .register_plugin(Box::new(HealthPlugin { version }), &[])
         .expect("third-party plugin registers");
+    session
+}
+
+/// Editor-profile session with the simulation plugin registered but not
+/// started, mirroring the composition root: play mode starts it on demand.
+fn session_for_play() -> RuntimeSession {
+    let mut session = RuntimeSession::new(
+        Engine::new(),
+        Profile::named("editor").expect("editor profile"),
+    );
+    session
+        .host_mut()
+        .register_plugin(
+            Box::new(moni_core::plugins::SimulationPlugin::new()),
+            &["script.execute".to_string()],
+        )
+        .expect("simulation registers");
     session
 }
 
@@ -536,6 +555,294 @@ fn undo_redo_of_create_and_delete_keeps_exact_entity_ids() {
     assert!(!document.session().world().entities.contains_key(&1));
     document.undo().expect("undo again");
     assert_eq!(document.session().world().entities[&1], before_delete);
+    let _ = fs::remove_file(&scene_path);
+}
+
+/// Play mode drives the session simulation (ticks advance through the
+/// started provider), and exit restores the exact pre-play world: play-time
+/// entities disappear, the tick returns to its pre-play value, the revision
+/// moves forward, and the document is conservatively dirty.
+#[test]
+fn play_mode_restores_the_pre_play_world_on_exit() {
+    let scene_path = seed_scene("play", "document-play", false);
+    let mut document = EditorDocument::new(session_for_play(), &scene_path).expect("open");
+    let revision_before = document.session().revision();
+
+    // World content attached before play (a script, here) survives as part
+    // of the restored pre-play world.
+    document
+        .attach_script(
+            document.session().revision(),
+            1,
+            "function tick() {}".to_string(),
+        )
+        .expect("attach before play");
+    document.enter_play().expect("enter play");
+    assert!(document.is_playing());
+    assert!(!document.is_paused());
+    document.pause();
+    assert!(document.is_paused());
+    document.resume();
+    assert!(!document.is_paused());
+
+    document
+        .session_mut()
+        .step(3)
+        .expect("ticks run through the started simulation provider");
+    assert_eq!(
+        document.session().world().tick,
+        3,
+        "the simulation ticks during play"
+    );
+
+    // Direct session commands model play-time simulation side effects; the
+    // document edit ops stay locked (asserted separately).
+    let spec: EntitySpec =
+        serde_json::from_value(json!({ "name": "play-only" })).expect("valid spec");
+    document
+        .session_mut()
+        .apply(Command::Spawn { spec })
+        .expect("play-time spawn");
+    assert_eq!(document.session().world().entities.len(), 2);
+
+    document.exit_play().expect("exit play");
+    assert!(!document.is_playing());
+    assert!(!document.is_paused());
+    assert_eq!(
+        document.session().world().entities.len(),
+        1,
+        "the play-time entity is gone"
+    );
+    assert_eq!(
+        document.session().world().tick,
+        0,
+        "the tick returns to the pre-play value"
+    );
+    assert!(
+        document.session().world().entities[&1].script.is_some(),
+        "pre-play content, including the pre-play script, is restored"
+    );
+    assert!(
+        document.session().revision() > revision_before,
+        "the restore moves the revision forward"
+    );
+    assert!(
+        document.is_dirty(),
+        "the exit restore is conservatively dirty"
+    );
+    let _ = fs::remove_file(&scene_path);
+}
+
+/// While playing, every document edit operation, save, scene switch, and a
+/// second enter_play refuses with the play-mode lock message; the play
+/// state itself is untouched by the refusals.
+#[test]
+fn play_mode_blocks_edits_saves_and_scene_switches() {
+    let scene_path = seed_scene("play-lock", "document-play-lock", false);
+    let mut document = EditorDocument::new(session_for_play(), &scene_path).expect("open");
+    document.enter_play().expect("enter play");
+    let revision = document.session().revision();
+    let spec: EntitySpec =
+        serde_json::from_value(json!({ "name": "blocked" })).expect("valid spec");
+    let rejects = |result: anyhow::Result<()>| {
+        let error = result.expect_err("playing documents refuse edits");
+        assert!(
+            error.to_string().contains("playing"),
+            "the refusal names the play lock: {error}"
+        );
+    };
+    rejects(document.apply(
+        "blocked",
+        revision,
+        Command::Spawn { spec: spec.clone() },
+        |_| Vec::new(),
+    ));
+    rejects(document.create_entity(revision, spec).map(|_| ()));
+    rejects(document.delete_entity(revision, 1));
+    rejects(document.rename_entity(revision, 1, "blocked"));
+    rejects(document.set_transform(
+        revision,
+        1,
+        Transform {
+            x: 1.0,
+            y: 1.0,
+            rotation: 0.0,
+        },
+    ));
+    rejects(document.attach_component(revision, 1, COMPONENT, json!({ "current": 5 })));
+    rejects(document.remove_component(revision, 1, COMPONENT));
+    rejects(document.attach_script(revision, 1, "function f() {}".to_string()));
+    rejects(document.undo().map(|_| ()));
+    rejects(document.redo().map(|_| ()));
+    rejects(document.save());
+    rejects(document.save_as("target/document-play-copy.mnsc"));
+    rejects(document.open_scene("target/wherever.mnsc"));
+    rejects(document.enter_play());
+
+    assert!(document.is_playing(), "refusals keep the play state");
+    assert!(
+        !document.is_dirty() || document.session().revision() >= revision,
+        "ticks may move the revision but refusals do not mutate"
+    );
+    document.exit_play().expect("exit play");
+    let _ = fs::remove_file(&scene_path);
+}
+
+/// open_scene refuses a dirty document, resets document state on success,
+/// and keeps registry-validated dynamic component values intact.
+#[test]
+fn open_scene_guards_dirty_swaps_state_and_keeps_components() {
+    let scene_a = seed_scene("open-a", "document-open-a", false);
+    let scene_b = seed_scene("open-b", "document-open-b", true);
+    let mut document =
+        EditorDocument::new(session_with_health(HEALTH_VERSION), &scene_a).expect("open");
+
+    let spec: EntitySpec =
+        serde_json::from_value(json!({ "name": "dirty-maker" })).expect("valid spec");
+    let created = document
+        .create_entity(document.session().revision(), spec)
+        .expect("create");
+    document.select([created]);
+    assert!(document.is_dirty());
+
+    let error = document
+        .open_scene(&scene_b)
+        .expect_err("a dirty document must refuse scene switches");
+    assert!(
+        error.to_string().contains("unsaved changes"),
+        "the refusal asks for a save first: {error}"
+    );
+    assert_eq!(
+        document.scene_path(),
+        scene_a.as_str(),
+        "the failed open keeps the old scene"
+    );
+    assert!(
+        document.session().world().entities.contains_key(&created),
+        "the failed open keeps the old world"
+    );
+
+    // After saving (undoing does not clear the revision-based dirty flag),
+    // the switch succeeds and resets state.
+    document.save().expect("save the dirty changes");
+    assert!(!document.is_dirty());
+    document
+        .open_scene(&scene_b)
+        .expect("open the clean switch");
+    assert_eq!(document.scene_path(), scene_b.as_str());
+    assert_eq!(document.scene_name(), "document-open-b");
+    assert_eq!(
+        document.undo_depth(),
+        0,
+        "history describes the previous scene and is cleared"
+    );
+    assert_eq!(document.redo_depth(), 0);
+    assert!(document.selection().is_empty());
+    assert!(
+        !document.is_dirty(),
+        "the new scene re-anchors the dirty state"
+    );
+    assert!(
+        !document.session().world().entities.contains_key(&created),
+        "the previous scene's entities are gone"
+    );
+    assert_eq!(
+        document.session().world().entities[&1].extensions[COMPONENT],
+        json!({ "current": 80, "maximum": 100 }),
+        "registry-validated dynamic components keep their values"
+    );
+    let _ = fs::remove_file(&scene_a);
+    let _ = fs::remove_file(&scene_b);
+}
+
+/// attach_script replaces through the engine validation, undo restores the
+/// previous source, a first attach cannot be undone to scriptless (the core
+/// command set has no script removal), and oversized sources surface
+/// `script_too_large` without changing anything.
+#[test]
+fn attach_script_replaces_with_undo_and_surfaces_size_limits() {
+    let scene_path = seed_scene("attach-script", "document-attach-script", false);
+    let mut document =
+        EditorDocument::new(session_with_health(HEALTH_VERSION), &scene_path).expect("open");
+
+    document
+        .attach_script(
+            document.session().revision(),
+            1,
+            "function first() {}".to_string(),
+        )
+        .expect("first attach");
+    assert_eq!(
+        document.session().world().entities[&1]
+            .script
+            .as_ref()
+            .expect("script attached")
+            .source,
+        "function first() {}"
+    );
+
+    // Replacing keeps one history step whose undo restores the previous
+    // source.
+    document
+        .attach_script(
+            document.session().revision(),
+            1,
+            "function second() {}".to_string(),
+        )
+        .expect("replace attach");
+    assert_eq!(document.undo_depth(), 2, "both attach steps stack");
+    assert_eq!(document.undo().expect("undo"), Some("attach_script"));
+    assert_eq!(
+        document.session().world().entities[&1]
+            .script
+            .as_ref()
+            .expect("script restored")
+            .source,
+        "function first() {}"
+    );
+    document.redo().expect("redo");
+    assert_eq!(
+        document.session().world().entities[&1]
+            .script
+            .as_ref()
+            .expect("script re-attached")
+            .source,
+        "function second() {}"
+    );
+
+    // Undoing the very first attach cannot restore "no script": the label is
+    // reported and the script stays attached.
+    let mut fresh =
+        EditorDocument::new(session_with_health(HEALTH_VERSION), &scene_path).expect("reopen");
+    fresh
+        .attach_script(
+            fresh.session().revision(),
+            1,
+            "function only() {}".to_string(),
+        )
+        .expect("attach");
+    assert_eq!(fresh.undo().expect("undo"), Some("attach_script"));
+    assert!(
+        fresh.session().world().entities[&1].script.is_some(),
+        "the first attach cannot be undone to scriptless"
+    );
+
+    // An oversized source is rejected by the engine before any state
+    // changes.
+    let oversized = "x".repeat(MAX_SCRIPT_BYTES + 1);
+    let error = fresh
+        .attach_script(fresh.session().revision(), 1, oversized)
+        .expect_err("an oversized source must be rejected");
+    let engine_error = error.downcast_ref::<EngineError>().expect("engine error");
+    assert_eq!(engine_error.code, "script_too_large");
+    assert_eq!(
+        fresh.session().world().entities[&1]
+            .script
+            .as_ref()
+            .expect("script untouched")
+            .source,
+        "function only() {}"
+    );
     let _ = fs::remove_file(&scene_path);
 }
 

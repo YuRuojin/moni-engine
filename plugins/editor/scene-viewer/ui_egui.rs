@@ -7,10 +7,12 @@
 //! error line instead of breaking selection or history.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use moni_core::components::{PropertyField, PropertySchema, PropertyType};
-use moni_core::engine::{EntityId, EntitySpec};
+use moni_core::engine::{EntityId, EntitySpec, MAX_SCRIPT_BYTES};
+use moni_core::scene3d::{MeshKind, Model3d, Transform3d};
 use serde_json::{Value, json};
 use winit::event::WindowEvent;
 use winit::window::Window;
@@ -56,6 +58,8 @@ struct Panels {
     /// Attachable component ids cached per session revision; component
     /// registration is a revision bump, so the cache cannot go stale.
     registered_components: Option<(u64, Vec<String>)>,
+    /// Workspace asset listing cached by the asset browser panel.
+    asset_browser: AssetBrowser,
 }
 
 impl Default for Panels {
@@ -68,6 +72,7 @@ impl Default for Panels {
             renames: BTreeMap::new(),
             inspector_name: None,
             registered_components: None,
+            asset_browser: AssetBrowser::default(),
         }
     }
 }
@@ -104,6 +109,12 @@ impl EditorUi {
         self.context.egui_wants_keyboard_input()
     }
 
+    /// Surfaces an error from outside the panel callbacks (for example a
+    /// simulation failure that exits play mode) on the shared error line.
+    pub fn set_error(&mut self, message: String) {
+        self.panels.error = Some(message);
+    }
+
     /// Runs one egui pass: gathers input, builds the panels against
     /// `document`, applies platform output, and tessellates the produced
     /// shapes on this context. Returns the frame payload for the render
@@ -127,8 +138,10 @@ impl Panels {
     fn show(&mut self, ctx: &egui::Context, document: &mut EditorDocument) {
         self.handle_shortcuts(ctx, document);
         ctx.root_ui(|ui| {
+            self.show_playback(ui, document);
             self.show_hierarchy(ui, document);
             self.show_inspector(ui, document);
+            self.show_asset_browser(ui, document);
         });
     }
 
@@ -184,6 +197,52 @@ impl Panels {
             Ok(()) => self.error = None,
             Err(error) => self.error = Some(format!("save failed: {error:#}")),
         }
+    }
+
+    /// Play-mode toolbar: enter/pause/resume/stop buttons, a state
+    /// indicator, and the current tick. Edit operations stay clickable but
+    /// the document refuses them while playing; the shared error line in the
+    /// inspector explains each rejection.
+    fn show_playback(&mut self, ui: &mut egui::Ui, document: &mut EditorDocument) {
+        egui::Panel::top("playback_panel").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let playing = document.is_playing();
+                if ui
+                    .add_enabled(!playing, egui::Button::new("Play"))
+                    .clicked()
+                {
+                    match document.enter_play() {
+                        Ok(()) => self.error = None,
+                        Err(error) => self.error = Some(format!("play failed: {error:#}")),
+                    }
+                }
+                if ui
+                    .add_enabled(playing && !document.is_paused(), egui::Button::new("Pause"))
+                    .clicked()
+                {
+                    document.pause();
+                }
+                if ui
+                    .add_enabled(document.is_paused(), egui::Button::new("Resume"))
+                    .clicked()
+                {
+                    document.resume();
+                }
+                if ui.add_enabled(playing, egui::Button::new("Stop")).clicked() {
+                    match document.exit_play() {
+                        Ok(()) => self.error = None,
+                        Err(error) => self.error = Some(format!("stop failed: {error:#}")),
+                    }
+                }
+                if document.is_paused() {
+                    ui.colored_label(egui::Color32::YELLOW, "PAUSED");
+                } else if playing {
+                    ui.colored_label(egui::Color32::from_rgb(110, 220, 110), "PLAYING");
+                }
+                ui.label(format!("tick {}", document.session().world().tick));
+                ui.label("(Space toggles play)");
+            });
+        });
     }
 
     /// Entity list with create, per-entity delete, and rename; clicking a row
@@ -522,8 +581,13 @@ impl Panels {
             if document.is_dirty() {
                 ui.colored_label(egui::Color32::YELLOW, "unsaved changes");
             }
+            // Play state is transient and unsavable; the document refuses
+            // anyway, so the button just does not offer the broken path.
             if ui
-                .add_enabled(document.is_dirty(), egui::Button::new("Save"))
+                .add_enabled(
+                    document.is_dirty() && !document.is_playing(),
+                    egui::Button::new("Save"),
+                )
                 .clicked()
             {
                 self.save(document);
@@ -542,6 +606,178 @@ impl Panels {
                 }
             }
         });
+    }
+
+    /// Bottom asset browser: a flat categorized listing of the workspace's
+    /// scenes, models, and scripts with open/spawn/attach actions. The
+    /// listing is cached and rebuilt on session revision changes outside
+    /// play mode, or from the Refresh button — never per frame.
+    fn show_asset_browser(&mut self, ui: &mut egui::Ui, document: &mut EditorDocument) {
+        egui::Panel::bottom("asset_browser_panel").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("Assets");
+                if ui.small_button("Refresh").clicked() {
+                    self.asset_browser.cached_revision = Some(document.session().revision());
+                    self.asset_browser.listing = Some(walk_workspace_assets());
+                }
+                let truncated = self
+                    .asset_browser
+                    .listing
+                    .as_ref()
+                    .is_some_and(|listing| listing.truncated);
+                if truncated {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        format!("listing truncated at {ASSET_WALK_MAX_ENTRIES} entries"),
+                    );
+                }
+            });
+            self.refresh_assets(document);
+            if self.asset_browser.listing.is_none() {
+                return;
+            }
+            // The listing is owned locally while the closure runs so the
+            // action handlers can borrow the panels mutably; it is put back
+            // afterwards, keeping the cache across frames.
+            let listing = self
+                .asset_browser
+                .listing
+                .take()
+                .expect("checked directly above");
+            egui::ScrollArea::vertical()
+                .max_height(140.0)
+                .show(ui, |ui| {
+                    if !listing.scenes.is_empty() {
+                        ui.label(egui::RichText::new("Scenes").strong());
+                    }
+                    for entry in &listing.scenes {
+                        ui.horizontal(|ui| {
+                            ui.label(&entry.name).on_hover_text(&entry.path);
+                            if ui.small_button("Open").clicked() {
+                                match document.open_scene(&entry.path) {
+                                    Ok(()) => self.error = None,
+                                    Err(error) => {
+                                        self.error = Some(format!("open scene failed: {error:#}"))
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    if !listing.models.is_empty() {
+                        ui.label(egui::RichText::new("Models").strong());
+                    }
+                    for entry in &listing.models {
+                        ui.horizontal(|ui| {
+                            ui.label(&entry.name).on_hover_text(&entry.path);
+                            if ui.small_button("Spawn").clicked() {
+                                self.spawn_model(document, &entry.path);
+                            }
+                        });
+                    }
+                    if !listing.scripts.is_empty() {
+                        ui.label(egui::RichText::new("Scripts").strong());
+                    }
+                    for entry in &listing.scripts {
+                        ui.horizontal(|ui| {
+                            ui.label(&entry.name).on_hover_text(&entry.path);
+                            if ui.small_button("Attach to selected").clicked() {
+                                self.attach_script_asset(document, &entry.path);
+                            }
+                        });
+                    }
+                    if listing.scenes.is_empty()
+                        && listing.models.is_empty()
+                        && listing.scripts.is_empty()
+                    {
+                        ui.label("no scenes, models, or scripts found in the workspace");
+                    }
+                });
+            self.asset_browser.listing = Some(listing);
+            ui.add_space(2.0);
+        });
+    }
+
+    /// Rebuilds the asset listing when the session revision moved, except
+    /// while playing: play ticks bump the revision every frame, so a playing
+    /// session keeps its cached listing until stopped or refreshed.
+    fn refresh_assets(&mut self, document: &mut EditorDocument) {
+        let revision = document.session().revision();
+        if self.asset_browser.listing.is_some()
+            && (self.asset_browser.cached_revision == Some(revision) || document.is_playing())
+        {
+            return;
+        }
+        self.asset_browser.cached_revision = Some(revision);
+        self.asset_browser.listing = Some(walk_workspace_assets());
+    }
+
+    /// Spawns an entity carrying the model asset as an FBX component. Both
+    /// `.fbx` and cooked `.mnec` sources pass the engine's `Model3d`
+    /// validation for `kind = fbx` (workspace-relative source ending in
+    /// `.fbx` or `.mnec`), so both asset kinds spawn.
+    fn spawn_model(&mut self, document: &mut EditorDocument, path: &str) {
+        let name = file_stem(basename(path));
+        let spec = EntitySpec {
+            name: Some(name),
+            model: Some(Model3d {
+                kind: MeshKind::Fbx,
+                source: Some(path.to_string()),
+                transform: Transform3d::default(),
+                color: "#ffffff".to_string(),
+                metallic: 0.0,
+                roughness: 0.5,
+            }),
+            ..EntitySpec::default()
+        };
+        match document.create_entity(document.session().revision(), spec) {
+            Ok(id) => {
+                self.error = None;
+                document.select([id]);
+            }
+            Err(error) => self.error = Some(format!("spawn model failed: {error:#}")),
+        }
+    }
+
+    /// Reads a script asset and attaches it to the first selected entity.
+    /// The size is capped before reading so a huge file never reaches
+    /// memory; the engine's own `script_too_large` guard stays the
+    /// authoritative check.
+    fn attach_script_asset(&mut self, document: &mut EditorDocument, path: &str) {
+        let Some(selected) = document.selection().iter().next().copied() else {
+            self.error = Some("select an entity in the hierarchy first".to_string());
+            return;
+        };
+        let resolved = match moni_core::workspace_path(path) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                self.error = Some(format!("invalid script path {path}: {error}"));
+                return;
+            }
+        };
+        match std::fs::metadata(&resolved) {
+            Ok(metadata) if metadata.len() > MAX_SCRIPT_BYTES as u64 => {
+                self.error = Some(format!(
+                    "script_too_large: {path} exceeds {MAX_SCRIPT_BYTES} bytes"
+                ));
+                return;
+            }
+            Err(error) => {
+                self.error = Some(format!("could not read script {path}: {error}"));
+                return;
+            }
+            Ok(_) => {}
+        }
+        let source = match std::fs::read_to_string(&resolved) {
+            Ok(source) => source,
+            Err(error) => {
+                self.error = Some(format!("could not read script {path}: {error}"));
+                return;
+            }
+        };
+        match document.attach_script(document.session().revision(), selected, source) {
+            Ok(()) => self.error = None,
+            Err(error) => self.error = Some(format!("attach script failed: {error:#}")),
+        }
     }
 
     /// The last rejected edit as a plain error line; it clears on the next
@@ -687,4 +923,160 @@ fn default_component_value(schema: &PropertySchema) -> Value {
 
 fn pretty_json(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+/// The file name portion of a workspace-relative asset path.
+fn basename(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+/// File name without its extension, used as the spawned entity's name.
+fn file_stem(name: &str) -> String {
+    match name.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => stem.to_string(),
+        _ => name.to_string(),
+    }
+}
+
+/// Maximum directory depth (below the workspace root) the asset walk
+/// descends to; files up to three levels deep are listed.
+const ASSET_WALK_MAX_DEPTH: usize = 3;
+
+/// Entry cap for the asset walk so a large workspace cannot blow up the
+/// panel; the listing reports truncation.
+const ASSET_WALK_MAX_ENTRIES: usize = 500;
+
+/// Asset extensions the browser lists, mapped to categories in the walk.
+const ASSET_SCENE_EXTENSIONS: [&str; 1] = ["mnsc"];
+const ASSET_MODEL_EXTENSIONS: [&str; 2] = ["fbx", "mnec"];
+const ASSET_SCRIPT_EXTENSIONS: [&str; 2] = ["js", "ts"];
+
+/// Directory names excluded from the asset walk (build output, package
+/// caches, VCS internals).
+const ASSET_SKIPPED_DIRECTORIES: [&str; 3] = ["target", "node_modules", ".git"];
+
+/// One listed asset: the file name shown in the panel and the
+/// workspace-relative path the actions use.
+struct AssetEntry {
+    name: String,
+    path: String,
+}
+
+/// A bounded workspace listing grouped by category.
+#[derive(Default)]
+struct AssetListing {
+    scenes: Vec<AssetEntry>,
+    models: Vec<AssetEntry>,
+    scripts: Vec<AssetEntry>,
+    /// True when the walk stopped at the entry cap.
+    truncated: bool,
+    /// Unreadable workspace root; individual unreadable directories are
+    /// skipped silently.
+    error: Option<String>,
+}
+
+impl AssetListing {
+    fn total(&self) -> usize {
+        self.scenes.len() + self.models.len() + self.scripts.len()
+    }
+
+    fn push(&mut self, extension: &str, entry: AssetEntry) {
+        if self.total() >= ASSET_WALK_MAX_ENTRIES {
+            self.truncated = true;
+            return;
+        }
+        let lowered = extension.to_ascii_lowercase();
+        if ASSET_SCENE_EXTENSIONS.contains(&lowered.as_str()) {
+            self.scenes.push(entry);
+        } else if ASSET_MODEL_EXTENSIONS.contains(&lowered.as_str()) {
+            self.models.push(entry);
+        } else if ASSET_SCRIPT_EXTENSIONS.contains(&lowered.as_str()) {
+            self.scripts.push(entry);
+        }
+    }
+}
+
+/// Cached workspace listing for the asset browser. `cached_revision` records
+/// the session revision the listing was built at.
+#[derive(Default)]
+struct AssetBrowser {
+    cached_revision: Option<u64>,
+    listing: Option<AssetListing>,
+}
+
+/// Walks the workspace root (the current directory) for scene, model, and
+/// script files up to [`ASSET_WALK_MAX_DEPTH`] levels deep, skipping build
+/// and VCS directories. Flat and bounded: directories beyond the depth cap,
+/// unreadable directories, and entries past the cap are skipped.
+fn walk_workspace_assets() -> AssetListing {
+    let mut listing = AssetListing::default();
+    let root = match std::env::current_dir() {
+        Ok(root) => root,
+        Err(error) => {
+            listing.error = Some(format!("could not read the workspace root: {error}"));
+            return listing;
+        }
+    };
+    walk_assets(&root, &root, 0, &mut listing);
+    listing
+}
+
+fn walk_assets(root: &Path, directory: &Path, depth: usize, listing: &mut AssetListing) {
+    if listing.truncated {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if listing.truncated {
+            return;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        if file_type.is_dir() {
+            if depth >= ASSET_WALK_MAX_DEPTH || ASSET_SKIPPED_DIRECTORIES.contains(&name.as_str()) {
+                continue;
+            }
+            // `examples/dist` holds built demo bundles; skipping every
+            // directory named `dist` would over-exclude, so the path is
+            // matched exactly.
+            let relative = relative_workspace_path(root, &path);
+            if relative == "examples/dist" || relative.starts_with("examples/dist/") {
+                continue;
+            }
+            walk_assets(root, &path, depth + 1, listing);
+        } else if file_type.is_file() {
+            let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+                continue;
+            };
+            let lowered = extension.to_ascii_lowercase();
+            let listed = ASSET_SCENE_EXTENSIONS.contains(&lowered.as_str())
+                || ASSET_MODEL_EXTENSIONS.contains(&lowered.as_str())
+                || ASSET_SCRIPT_EXTENSIONS.contains(&lowered.as_str());
+            if !listed {
+                continue;
+            }
+            listing.push(
+                &lowered,
+                AssetEntry {
+                    name,
+                    path: relative_workspace_path(root, &path),
+                },
+            );
+        }
+    }
+}
+
+/// The path relative to the workspace root with `/` separators, so entry
+/// paths match the workspace-relative contract of scene loading and model
+/// sources on every platform.
+fn relative_workspace_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }

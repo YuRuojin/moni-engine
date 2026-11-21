@@ -187,7 +187,7 @@ pub fn build_overlay(
             left.push("  SCRIPT ATTACHED".to_string());
         }
     }
-    left.push("READ ONLY - NO SCRIPT TICK".to_string());
+    left.push("EDITABLE - SPACE PLAY/STOP".to_string());
     left.push("ARROWS MOVE CAMERA".to_string());
     left.push("PGUP/PGDN ZOOM HOME RESET".to_string());
     for (index, line) in left.iter().enumerate() {

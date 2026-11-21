@@ -137,6 +137,10 @@ struct EditorApp {
     golden_mode: bool,
     golden_path: Option<PathBuf>,
     failure: Option<anyhow::Error>,
+    /// Play-mode fixed-step accumulator state, shared semantics with the
+    /// windowed client's `advance_simulation`.
+    last_update: Instant,
+    accumulator_seconds: f64,
 }
 
 impl EditorApp {
@@ -165,6 +169,8 @@ impl EditorApp {
             golden_mode: golden_path.is_some(),
             golden_path,
             failure: None,
+            last_update: Instant::now(),
+            accumulator_seconds: 0.0,
         }
     }
 
@@ -235,6 +241,51 @@ fn zoom_camera(camera: &mut Camera3d, factor: f64) {
     };
     if camera.projection == CameraProjection::Orthographic {
         camera.orthographic_height = (camera.orthographic_height * factor).clamp(1.0, 50.0);
+    }
+}
+
+/// Advances play-mode ticks with the windowed client's fixed-step
+/// accumulator: up to 5 ticks per frame, surplus time dropped so a stall
+/// cannot spiral into a catch-up burst. Ticks go through
+/// `RuntimeSession::step`, so scheduling, revisions, and events match the
+/// agent control path exactly.
+fn advance_play(
+    document: &mut EditorDocument,
+    last_update: &mut Instant,
+    accumulator_seconds: &mut f64,
+) -> anyhow::Result<()> {
+    let now = Instant::now();
+    let elapsed = now.duration_since(*last_update).as_secs_f64();
+    *last_update = now;
+    *accumulator_seconds += elapsed;
+
+    let tick_seconds = 1.0 / f64::from(document.session().world().tick_rate);
+    let steps = (*accumulator_seconds / tick_seconds).floor() as u64;
+    if steps == 0 {
+        return Ok(());
+    }
+    let applied_steps = steps.min(5);
+    document.session_mut().step(applied_steps)?;
+    if steps > applied_steps {
+        *accumulator_seconds = 0.0;
+    } else {
+        *accumulator_seconds -= applied_steps as f64 * tick_seconds;
+    }
+    Ok(())
+}
+
+/// Space toggles play mode: enters play when idle, exits when playing.
+/// Failures surface on the UI error line and leave the play state unchanged.
+fn toggle_play(document: &mut EditorDocument, ui: &mut Option<EditorUi>) {
+    let result = if document.is_playing() {
+        document.exit_play()
+    } else {
+        document.enter_play()
+    };
+    if let Err(error) = result
+        && let Some(ui) = ui.as_mut()
+    {
+        ui.set_error(format!("play mode failed: {error:#}"));
     }
 }
 
@@ -319,6 +370,14 @@ impl ApplicationHandler for EditorApp {
                     // camera navigation yields.
                 } else if self.camera_input(&event.logical_key) {
                     window.request_redraw();
+                } else if !self.golden_mode
+                    && event.logical_key == Key::Named(NamedKey::Space)
+                    && let Some(document) = self.document.as_mut()
+                {
+                    // Space toggles play mode (golden mode never plays so its
+                    // captures stay deterministic).
+                    toggle_play(document, &mut self.ui);
+                    window.request_redraw();
                 }
             }
             WindowEvent::Resized(size) => {
@@ -334,6 +393,40 @@ impl ApplicationHandler for EditorApp {
                 let Some(document) = self.document.as_mut() else {
                     return;
                 };
+                // Play mode drives the simulation before the render pass so
+                // the panels and the scene show this frame's ticks. A
+                // simulation failure exits play mode with the error surfaced
+                // on the UI error line instead of crashing the app.
+                if document.is_playing() && !document.is_paused() {
+                    if let Err(error) = advance_play(
+                        document,
+                        &mut self.last_update,
+                        &mut self.accumulator_seconds,
+                    ) {
+                        let message = format!("simulation failed: {error:#}");
+                        match document.exit_play() {
+                            Ok(()) => {
+                                self.accumulator_seconds = 0.0;
+                                if let Some(ui) = &mut self.ui {
+                                    ui.set_error(message);
+                                }
+                            }
+                            Err(exit_error) => {
+                                self.failure = Some(error.context(format!(
+                                    "exiting play mode after the simulation failure also failed: {exit_error:#}"
+                                )));
+                                event_loop.exit();
+                                return;
+                            }
+                        }
+                    }
+                } else {
+                    // Keep the accumulator fresh outside running play mode so
+                    // entering or resuming never replays idle time as a tick
+                    // burst.
+                    self.last_update = Instant::now();
+                    self.accumulator_seconds = 0.0;
+                }
                 let (preparation_ms, loaded_vertices) = document
                     .session_mut()
                     .host_mut()
@@ -359,10 +452,12 @@ impl ApplicationHandler for EditorApp {
                 } else {
                     // Rebuild the overlay quads only when their inputs
                     // changed; other frames keep the renderer's cached quads.
+                    // The scene path follows the document so the overlay
+                    // tracks scene switches made through the asset browser.
                     let world = document.session().world();
                     if let Some(quads) = self.overlay_cache.quads(
                         world,
-                        &self.scene_path,
+                        document.scene_path(),
                         preparation_ms,
                         self.frame_ms,
                         &self.gpu_samples,
