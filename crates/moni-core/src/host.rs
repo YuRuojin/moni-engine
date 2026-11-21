@@ -1029,6 +1029,38 @@ impl PluginHost {
         Ok(())
     }
 
+    /// Stops a started plugin: the inverse of [`PluginHost::start_plugin`].
+    /// Runs `Plugin::stop` with full context access, removes the plugin's
+    /// systems from the schedule (invalidating the schedule cache), and marks
+    /// it not-started. Registration-phase contributions (components,
+    /// services, commands, migrators) and granted permissions remain: the
+    /// plugin stays registered and can be started again with
+    /// [`PluginHost::start_plugin`], which re-schedules its systems. An
+    /// unknown ID fails with the `plugin_not_registered` semantics of
+    /// [`PluginHost::start_plugin`], a registered-but-unstarted plugin with
+    /// `plugin_not_started`; neither failure mutates the host.
+    pub fn stop_plugin(&mut self, id: &'static str) -> Result<(), PluginError> {
+        if !self.plugins.contains_key(id) {
+            return Err(PluginError::new(format!("plugin '{id}' is not registered")));
+        }
+        if !self.started.remove(id) {
+            return Err(PluginError::new(format!("plugin '{id}' is not started")));
+        }
+        self.systems.retain(|system| system.plugin_id != id);
+        self.invalidate_schedule();
+        let plugin = self.plugins.get_mut(id).expect("checked above");
+        let mut context = PluginContext {
+            engine: &mut self.engine,
+            permissions: &self.permissions,
+            services: &mut self.services,
+            commands: &mut self.commands,
+            plugin_id: id,
+            access: ContextAccess::full(),
+        };
+        plugin.stop(&mut context);
+        Ok(())
+    }
+
     /// Combined convenience path: register, then start. On ANY failure the
     /// host is restored to its pre-call state — a failed registration already
     /// revokes its own contributions, and a failed start is followed by
@@ -2158,6 +2190,109 @@ mod tests {
         host.run_stage(SystemStage::FixedUpdate)
             .expect("started systems execute");
         assert_eq!(host.world().tick, 1);
+    }
+
+    /// Stopping a started plugin keeps it registered with every
+    /// registration-phase contribution and permission, leaves it out of the
+    /// schedule, and a following start re-executes its FixedUpdate systems.
+    #[test]
+    fn stop_plugin_round_trip_restarts_fixed_update() {
+        let mut host = PluginHost::new(Engine::new());
+        host.register_plugin(
+            Box::new(ContributionPlugin { fail_start: false }),
+            &["test.permission".to_string()],
+        )
+        .expect("register phase succeeds");
+        host.start_plugin("test.contrib").expect("start");
+        host.run_stage(SystemStage::FixedUpdate)
+            .expect("started systems execute");
+        assert_eq!(host.world().tick, 1);
+
+        host.stop_plugin("test.contrib").expect("stop");
+        assert!(host.has_plugin("test.contrib"));
+        assert!(!host.is_started("test.contrib"));
+        // Contributions and permissions remain after the stop.
+        assert!(
+            host.engine()
+                .registry()
+                .resolve("test.contrib.health")
+                .is_some()
+        );
+        assert_eq!(
+            host.service_descriptions(),
+            vec![(
+                "test.contrib.state".to_string(),
+                "test.contrib" as &'static str
+            )]
+        );
+        assert_eq!(host.plugin_command_descriptions().len(), 1);
+        assert!(
+            host.permissions
+                .require("test.contrib", "test.permission")
+                .is_ok()
+        );
+        // The plugin's own stop hook ran (ContributionPlugin marks the world).
+        assert_eq!(host.world().tick_rate, 1);
+
+        // The stopped systems leave the schedule: the stage runs empty.
+        host.run_stage(SystemStage::FixedUpdate)
+            .expect("stage runs without the stopped systems");
+        assert_eq!(host.world().tick, 1, "stopped plugin systems never run");
+
+        // Restarting re-executes FixedUpdate without re-registration.
+        host.start_plugin("test.contrib").expect("restart");
+        host.run_stage(SystemStage::FixedUpdate)
+            .expect("restarted systems execute");
+        assert_eq!(host.world().tick, 2);
+    }
+
+    #[test]
+    fn stop_plugin_rejects_unknown_unstarted_and_double_stop() {
+        let mut host = PluginHost::new(Engine::new());
+        let error = host
+            .stop_plugin("test.contrib")
+            .expect_err("an unknown ID must fail");
+        assert!(error.message.contains("not registered"), "{error}");
+
+        host.register_plugin(Box::new(ContributionPlugin { fail_start: false }), &[])
+            .expect("register phase succeeds");
+        let error = host
+            .stop_plugin("test.contrib")
+            .expect_err("a registered-but-unstarted plugin must fail");
+        assert!(error.message.contains("not started"), "{error}");
+        assert!(!host.is_started("test.contrib"));
+
+        host.start_plugin("test.contrib").expect("start");
+        host.stop_plugin("test.contrib").expect("first stop");
+        let error = host
+            .stop_plugin("test.contrib")
+            .expect_err("a second stop must fail");
+        assert!(error.message.contains("not started"), "{error}");
+        assert!(host.has_plugin("test.contrib"));
+    }
+
+    /// Unregistering after a stop revokes the contributions exactly like the
+    /// direct path: the stopped plugin is still fully registered state.
+    #[test]
+    fn unregister_after_stop_removes_contributions() {
+        let mut host = PluginHost::new(Engine::new());
+        let handle = host
+            .register_plugin(Box::new(ContributionPlugin { fail_start: false }), &[])
+            .expect("register phase succeeds");
+        host.start_plugin("test.contrib").expect("start");
+        host.stop_plugin("test.contrib").expect("stop");
+
+        let removed = handle.dispose(&mut host).expect("unregister after stop");
+        assert_eq!(removed, vec!["test.contrib"]);
+        assert!(!host.has_plugin("test.contrib"));
+        assert!(
+            host.engine()
+                .registry()
+                .resolve("test.contrib.health")
+                .is_none()
+        );
+        assert!(host.service_descriptions().is_empty());
+        assert!(host.plugin_command_descriptions().is_empty());
     }
 
     #[test]

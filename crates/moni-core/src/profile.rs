@@ -523,7 +523,7 @@ fn static_bundle(name: &str) -> Result<&'static [&'static str], PluginError> {
     match name {
         "minimal" | "headless" => Ok(&[]),
         "default" => Ok(&["core.simulation", "core.render", "core.fbx"]),
-        "editor" => Ok(&["core.render", "core.fbx", "core.editor"]),
+        "editor" => Ok(&["core.simulation", "core.render", "core.fbx", "core.editor"]),
         "serve" => Ok(&["core.simulation"]),
         _ => Err(PluginError::new(format!("unknown bundle '{name}'"))),
     }
@@ -627,6 +627,18 @@ mod tests {
         assert!(version_matches("^abc", "0.1.0").is_err());
         assert!(validate_version_requirement("*").is_ok());
         assert!(validate_version_requirement("").is_err());
+    }
+
+    #[test]
+    fn editor_profile_resolves_core_simulation_for_play_mode() {
+        // The editor bundle must resolve a startable simulation provider so
+        // the editor's play mode can start it on demand; the composition root
+        // keeps it registered-but-unstarted until play begins.
+        let profile = Profile::named("editor").expect("editor profile");
+        let effective = profile
+            .resolve(&Target::current())
+            .expect("editor resolves");
+        assert!(effective.contains("core.simulation"));
     }
 
     #[test]

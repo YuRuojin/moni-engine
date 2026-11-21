@@ -52,7 +52,7 @@ Patches apply in declaration order. Besides the `enabled` switch, a patch may ca
 - `minimal`: empty composition.
 - `default`: `core.simulation`, `core.render`, and `core.fbx`.
 - `headless`: empty composition with no window, GPU, QuickJS, or FBX initialization.
-- `editor`: `core.render`, `core.fbx`, and `core.editor`, without QuickJS.
+- `editor`: `core.simulation`, `core.render`, `core.fbx`, and `core.editor`. `core.simulation` is registered with the bundle but stays unstarted until the editor's play mode starts it; the QuickJS runtime is installed by the composition root when building the editor session — script components stay inert data outside play mode and execute with the simulation ticks during play.
 - `serve`: `core.simulation`, used by the agent/CLI control path; the composition root installs the QuickJS runtime when building the session.
 
 ## Instantiation and pruning boundary
