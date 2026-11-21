@@ -15,9 +15,11 @@ use moni_core::host::{
     RenderPluginApi, Resource, SystemDescriptor, SystemStage, ThreadAffinity,
 };
 
-/// The `core.render` plugin instance.
+/// The `core.render` plugin instance. Construction is window-free so the
+/// registration phase can run headlessly; the window is attached with
+/// [`RenderPlugin::set_window`] before `start` creates the GPU renderer.
 pub struct RenderPlugin {
-    window: Arc<Window>,
+    window: Option<Arc<Window>>,
     renderer: Option<GpuRenderer>,
     collect_gpu_timestamps: bool,
     load_fbx_assets: bool,
@@ -27,19 +29,20 @@ pub struct RenderPlugin {
 impl RenderPlugin {
     pub const ID: &'static str = CORE_RENDER;
 
-    pub fn new(
-        window: Arc<Window>,
-        collect_gpu_timestamps: bool,
-        load_fbx_assets: bool,
-        hot_reload: bool,
-    ) -> Self {
+    pub fn new(collect_gpu_timestamps: bool, load_fbx_assets: bool, hot_reload: bool) -> Self {
         Self {
-            window,
+            window: None,
             renderer: None,
             collect_gpu_timestamps,
             load_fbx_assets,
             hot_reload,
         }
+    }
+
+    /// Attaches the surface window. Must be called before `start`; starting
+    /// without a window is a clear plugin error instead of a panic.
+    pub fn set_window(&mut self, window: Arc<Window>) {
+        self.window = Some(window);
     }
 }
 
@@ -79,6 +82,12 @@ impl RenderPluginApi for RenderPlugin {
         if let Some(renderer) = &mut self.renderer {
             renderer.capture_next(path);
         }
+    }
+
+    fn set_egui_frame(&mut self, frame: &mut dyn Any) -> bool {
+        self.renderer
+            .as_mut()
+            .is_some_and(|renderer| renderer.set_egui_frame(frame))
     }
 }
 
@@ -136,6 +145,14 @@ impl Plugin for RenderPlugin {
                     })?;
                     self.hot_reload = enabled;
                 }
+                "collectGpuTimestamps" => {
+                    let enabled = value.as_bool().ok_or_else(|| {
+                        PluginError::new(
+                            "core.render config 'collectGpuTimestamps' must be a boolean",
+                        )
+                    })?;
+                    self.collect_gpu_timestamps = enabled;
+                }
                 other => {
                     return Err(PluginError::new(format!(
                         "core.render config has unknown field '{other}'"
@@ -151,10 +168,15 @@ impl Plugin for RenderPlugin {
         if self.load_fbx_assets {
             context.require_from(moni_core::host::CORE_FBX, "asset.read.workspace")?;
         }
+        let Some(window) = self.window.clone() else {
+            return Err(PluginError::new(
+                "core.render requires a window but none was set; call set_window before start",
+            ));
+        };
         self.renderer = Some(
             GpuRenderer::new(
-                Arc::clone(&self.window),
-                context.engine.world(),
+                window,
+                context.world()?,
                 self.collect_gpu_timestamps,
                 self.load_fbx_assets,
                 self.hot_reload,
@@ -183,7 +205,7 @@ impl Plugin for RenderPlugin {
                     .renderer
                     .as_mut()
                     .ok_or_else(|| PluginError::new("render plugin is not started"))?
-                    .render(context.engine.world())
+                    .render(context.world()?)
                     .map_err(|error| PluginError::new(format!("{error:#}")))?;
                 Ok(PluginOutput::Render(status))
             }
@@ -207,5 +229,26 @@ impl Plugin for RenderPlugin {
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_egui_frame_is_rejected_without_a_started_renderer() {
+        let mut plugin = RenderPlugin::new(false, false, false);
+        let mut alien = 0_u64;
+        assert!(!plugin.set_egui_frame(&mut alien), "non-egui payload");
+        let mut frame = (
+            Vec::<egui::ClippedPrimitive>::new(),
+            egui::TexturesDelta::default(),
+            1.0_f32,
+        );
+        assert!(
+            !plugin.set_egui_frame(&mut frame),
+            "a matching payload is still rejected while the renderer is not started"
+        );
     }
 }

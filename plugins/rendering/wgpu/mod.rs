@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -7,9 +8,11 @@ use anyhow::{Context, bail};
 use bytemuck::{Pod, Zeroable};
 use moni_assets::fbx::FbxMesh;
 use moni_assets::runtime::AssetRuntime;
-use moni_core::engine::{SpriteKind, World};
+use moni_core::engine::{Sprite, SpriteKind, Transform, World};
 use moni_core::host::{OverlayQuad, RenderStatus};
-use moni_core::scene3d::{Camera3d, CameraProjection, Light, MeshKind, Transform3d, Vector3};
+use moni_core::scene3d::{
+    Camera3d, CameraProjection, Light, MeshKind, Model3d, Transform3d, Vector3,
+};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
@@ -26,7 +29,7 @@ const MAX_POINT_LIGHTS: usize = 8;
 const MAX_CACHED_COLORS: usize = 4_096;
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 struct Vertex {
     position: [f32; 2],
     color: [f32; 4],
@@ -41,7 +44,7 @@ impl Vertex {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 struct Vertex3d {
     position: [f32; 3],
     normal: [f32; 3],
@@ -140,11 +143,89 @@ impl GpuTiming {
     }
 }
 
-struct FbxGpuObject {
+/// Identifies one shared FBX GPU mesh: the same source file, tint color, and
+/// hot-reload revision of the parsed asset. Two entities whose models resolve
+/// to the same key draw from one vertex buffer.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct FbxMeshKey {
     source: String,
     color: String,
     revision: u64,
+}
+
+/// GPU vertex payload shared by every entity whose FBX model resolves to the
+/// same mesh key.
+struct FbxSharedGpuMesh {
+    vertex_buffer: wgpu::Buffer,
+    vertex_count: u32,
+}
+
+/// Reference-counted cache of payloads shared across entities. Entries are
+/// removed as soon as their reference count drops to zero, so GPU memory
+/// tracks the live entity set instead of growing unboundedly.
+struct SharedMeshCache<V> {
+    entries: BTreeMap<FbxMeshKey, SharedMeshEntry<V>>,
+}
+
+struct SharedMeshEntry<V> {
+    payload: V,
+    references: u32,
+}
+
+impl<V> Default for SharedMeshCache<V> {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+        }
+    }
+}
+
+impl<V> SharedMeshCache<V> {
+    fn get(&self, key: &FbxMeshKey) -> Option<&V> {
+        self.entries.get(key).map(|entry| &entry.payload)
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Increments the reference count for `key`, calling `create` to build the
+    /// payload when no entry exists yet.
+    fn acquire(&mut self, key: FbxMeshKey, create: impl FnOnce() -> V) -> &V {
+        let entry = self.entries.entry(key).or_insert_with(|| SharedMeshEntry {
+            payload: create(),
+            references: 0,
+        });
+        entry.references += 1;
+        &entry.payload
+    }
+
+    /// Decrements the reference count for `key` and drops the entry, releasing
+    /// the GPU payload, once the last reference goes away. Unknown keys are
+    /// ignored so callers can release after a failed build.
+    fn release(&mut self, key: &FbxMeshKey) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.references = entry.references.saturating_sub(1);
+            if entry.references == 0 {
+                self.entries.remove(key);
+            }
+        }
+    }
+
+    /// Drops entries whose reference count reached zero without an explicit
+    /// release; with exact bookkeeping this removes nothing.
+    fn retain_referenced(&mut self) {
+        self.entries.retain(|_, entry| entry.references > 0);
+    }
+}
+
+struct FbxGpuObject {
+    /// The shared mesh key this entity currently draws; a change in any field
+    /// rebuilds the entity against a new shared entry.
+    key: FbxMeshKey,
     transform: Transform3d,
+    /// Handle to the shared entry: wgpu buffers are internally refcounted, so
+    /// this clone stays valid while the object holds a cache reference.
     vertex_buffer: wgpu::Buffer,
     vertex_count: u32,
     model_buffer: wgpu::Buffer,
@@ -170,11 +251,13 @@ pub struct GpuRenderer {
     model_bind_group_layout: wgpu::BindGroupLayout,
     identity_model_bind_group: wgpu::BindGroup,
     fbx_objects: BTreeMap<u64, FbxGpuObject>,
+    /// GPU vertex payloads shared by every entity with the same FBX mesh key.
+    fbx_shared_meshes: SharedMeshCache<FbxSharedGpuMesh>,
     depth_view: wgpu::TextureView,
     sprite_vertices: Vec<Vertex>,
     mesh_vertices: Vec<Vertex3d>,
-    sprite_order: Vec<(i32, u64)>,
-    overlay_quads: Vec<OverlayQuad>,
+    /// CPU-side vertex caches for the sprite, built-in-3D, and overlay paths.
+    vertex_caches: VertexCaches,
     sprite_vertex_buffer: wgpu::Buffer,
     mesh_vertex_buffer: wgpu::Buffer,
     sprite_vertex_capacity: usize,
@@ -189,7 +272,19 @@ pub struct GpuRenderer {
     gpu_samples: Vec<(f32, f32)>,
     capture_path: Option<PathBuf>,
     last_preparation_time: Duration,
+    /// egui compositor for editor UI frames; owns the egui GPU resources and
+    /// paints onto the same surface view as the scene passes.
+    egui_painter: egui_wgpu::Renderer,
+    /// Editor UI frame handed over through `set_egui_frame`; consumed and
+    /// freed by the next rendered frame.
+    pending_egui: Option<EguiFrame>,
 }
+
+/// The editor UI frame payload crossing the type-erased render API: the
+/// frame's tessellated primitives (tessellated by the editor's egui context,
+/// whose font atlas normalizes the glyph UVs), its texture deltas, and the
+/// pixels-per-point scale for the screen descriptor.
+type EguiFrame = (Vec<egui::ClippedPrimitive>, egui::TexturesDelta, f32);
 
 impl GpuRenderer {
     pub fn new(
@@ -270,6 +365,12 @@ impl GpuRenderer {
             view_formats: Vec::new(),
         };
         surface.configure(&device, &config);
+
+        // The egui compositor shares the surface format so editor UI paints
+        // onto the same view as the scene passes. It stays unused until an
+        // editor hands over a frame through the type-erased render API.
+        let egui_painter =
+            egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("moni sprite shader"),
@@ -617,11 +718,11 @@ impl GpuRenderer {
             model_bind_group_layout,
             identity_model_bind_group,
             fbx_objects: BTreeMap::new(),
+            fbx_shared_meshes: SharedMeshCache::default(),
             depth_view,
             sprite_vertices: Vec::with_capacity(INITIAL_SPRITE_VERTEX_CAPACITY),
             mesh_vertices: Vec::with_capacity(INITIAL_MESH_VERTEX_CAPACITY),
-            sprite_order: Vec::with_capacity(64),
-            overlay_quads: Vec::new(),
+            vertex_caches: VertexCaches::default(),
             sprite_vertex_buffer,
             mesh_vertex_buffer,
             sprite_vertex_capacity: INITIAL_SPRITE_VERTEX_CAPACITY,
@@ -636,6 +737,8 @@ impl GpuRenderer {
             gpu_samples: Vec::new(),
             capture_path: None,
             last_preparation_time: Duration::ZERO,
+            egui_painter,
+            pending_egui: None,
         };
         renderer.prepare_fbx_objects(world, true)?;
         Ok(renderer)
@@ -663,7 +766,7 @@ impl GpuRenderer {
     }
 
     pub fn set_overlay_quads(&mut self, quads: Vec<OverlayQuad>) {
-        self.overlay_quads = quads;
+        self.vertex_caches.set_overlay_quads(quads);
     }
 
     pub fn gpu_timestamps_supported(&self) -> bool {
@@ -676,6 +779,13 @@ impl GpuRenderer {
 
     pub fn capture_next(&mut self, path: PathBuf) {
         self.capture_path = Some(path);
+    }
+
+    /// Stores a type-erased editor UI frame for the next rendered frame.
+    /// Returns `false` when the payload is not the `egui::FullOutput` this
+    /// build understands; the frame slot then keeps its previous content.
+    pub fn set_egui_frame(&mut self, frame: &mut dyn Any) -> bool {
+        store_egui_frame(&mut self.pending_egui, frame)
     }
 
     fn prepare_capture(
@@ -800,18 +910,32 @@ impl GpuRenderer {
     fn prepare_fbx_objects(&mut self, world: &World, preload: bool) -> anyhow::Result<()> {
         if !self.load_fbx_assets {
             self.fbx_objects.clear();
+            self.fbx_shared_meshes.clear();
             self.fbx_meshes.clear();
             self.assets.shutdown();
             return Ok(());
         }
-        self.fbx_objects.retain(|id, _| {
-            world.entities.get(id).is_some_and(|entity| {
-                entity
-                    .model
-                    .as_ref()
-                    .is_some_and(|model| model.kind == MeshKind::Fbx)
+        // Entities that despawned or switched away from FBX release their
+        // shared mesh reference here; key changes release at the rebuild site
+        // below.
+        let stale_ids: Vec<u64> = self
+            .fbx_objects
+            .keys()
+            .copied()
+            .filter(|id| {
+                world.entities.get(id).is_none_or(|entity| {
+                    entity
+                        .model
+                        .as_ref()
+                        .is_none_or(|model| model.kind != MeshKind::Fbx)
+                })
             })
-        });
+            .collect();
+        for id in stale_ids {
+            if let Some(object) = self.fbx_objects.remove(&id) {
+                self.fbx_shared_meshes.release(&object.key);
+            }
+        }
         let mut references = BTreeMap::new();
         for model in world
             .entities
@@ -885,7 +1009,7 @@ impl GpuRenderer {
                 self.report_asset_failure(&format!("reload:{source}"), message);
             }
             // Swap in a freshly reloaded revision as soon as it arrives; the
-            // vertex buffers rebuild below through the revision mismatch.
+            // shared mesh rebuilds below through the key mismatch.
             if let Some(handle) = self.assets.handle(source) {
                 let loaded_revision = self.fbx_meshes[source].1;
                 if handle.revision != loaded_revision {
@@ -899,28 +1023,31 @@ impl GpuRenderer {
                 (Arc::clone(&entry.0), entry.1)
             };
             let rebuild = self.fbx_objects.get(&entity.id).is_none_or(|object| {
-                object.source != source
-                    || object.color != model.color
-                    || object.revision != revision
+                object.key.source != *source
+                    || object.key.color != model.color
+                    || object.key.revision != revision
             });
             if rebuild {
-                let fallback = self.color_cache.get(&model.color);
-                let vertices: Vec<Vertex3d> = mesh
-                    .vertices
-                    .iter()
-                    .map(|vertex| Vertex3d {
-                        position: vertex.position,
-                        normal: vertex.normal,
-                        color: vertex.color.unwrap_or(fallback),
-                    })
-                    .collect();
-                let vertex_buffer =
-                    self.device
-                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some(source),
-                            contents: bytemuck::cast_slice(&vertices),
-                            usage: wgpu::BufferUsages::VERTEX,
-                        });
+                let key = FbxMeshKey {
+                    source: source.to_string(),
+                    color: model.color.clone(),
+                    revision,
+                };
+                // Build the new payload before mutating anything so a failed
+                // build leaves the previous object and cache entry intact.
+                let fresh = if self.fbx_shared_meshes.get(&key).is_some() {
+                    None
+                } else {
+                    Some(self.build_fbx_shared_mesh(source, &mesh, &model.color)?)
+                };
+                if let Some(object) = self.fbx_objects.remove(&entity.id) {
+                    self.fbx_shared_meshes.release(&object.key);
+                }
+                let payload = self.fbx_shared_meshes.acquire(key.clone(), || {
+                    fresh.expect("shared mesh payload was built for the missing key")
+                });
+                let vertex_buffer = payload.vertex_buffer.clone();
+                let vertex_count = payload.vertex_count;
                 let model_buffer = create_model_buffer(&self.device, "3D model transform");
                 let model_bind_group = create_model_bind_group(
                     &self.device,
@@ -931,13 +1058,10 @@ impl GpuRenderer {
                 self.fbx_objects.insert(
                     entity.id,
                     FbxGpuObject {
-                        source: source.to_string(),
-                        color: model.color.clone(),
-                        revision,
+                        key,
                         transform: model.transform,
                         vertex_buffer,
-                        vertex_count: u32::try_from(vertices.len())
-                            .context("FBX vertex count exceeds u32")?,
+                        vertex_count,
                         model_buffer,
                         model_bind_group,
                     },
@@ -958,7 +1082,41 @@ impl GpuRenderer {
                 )),
             );
         }
+        // Defensive sweep: with exact bookkeeping every entry holds a positive
+        // reference count; this guards against unbounded growth if a future
+        // change drops an entity object without releasing its key.
+        self.fbx_shared_meshes.retain_referenced();
         Ok(())
+    }
+
+    /// Builds the shared GPU vertex payload for one FBX mesh key. Every entity
+    /// resolving to the same (source, color, revision) draws from this buffer.
+    fn build_fbx_shared_mesh(
+        &mut self,
+        source: &str,
+        mesh: &FbxMesh,
+        color: &str,
+    ) -> anyhow::Result<FbxSharedGpuMesh> {
+        let fallback = self.color_cache.get(color);
+        let vertices: Vec<Vertex3d> = mesh
+            .vertices
+            .iter()
+            .map(|vertex| Vertex3d {
+                position: vertex.position,
+                normal: vertex.normal,
+                color: vertex.color.unwrap_or(fallback),
+            })
+            .collect();
+        Ok(FbxSharedGpuMesh {
+            vertex_buffer: self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(source),
+                    contents: bytemuck::cast_slice(&vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+            vertex_count: u32::try_from(vertices.len()).context("FBX vertex count exceeds u32")?,
+        })
     }
 
     /// Runtime asset failures degrade to "skip this entity this frame" with a
@@ -1001,40 +1159,36 @@ impl GpuRenderer {
         }
         let preparation_started = Instant::now();
         self.prepare_fbx_objects(world, false)?;
-        build_vertices(
-            world,
-            &mut self.sprite_vertices,
-            &mut self.sprite_order,
-            &mut self.color_cache,
-        );
-        for quad in &self.overlay_quads {
-            push_rectangle(
-                &mut self.sprite_vertices,
-                quad.x,
-                quad.y,
-                quad.width,
-                quad.height,
-                0.0,
-                quad.color,
+        // Sprite and built-in-3D segments are rebuilt only for entities whose
+        // inputs changed; the assembled buffers are re-uploaded only when
+        // their contents change.
+        let sprite_segments_changed =
+            rebuild_sprite_segments(world, &mut self.vertex_caches, &mut self.color_cache);
+        let mesh_segments_changed =
+            rebuild_mesh_3d_segments(world, &mut self.vertex_caches, &mut self.color_cache);
+        if sprite_segments_changed || self.vertex_caches.overlay.dirty {
+            assemble_sprite_vertices(&self.vertex_caches, &mut self.sprite_vertices);
+            upload_vertices(
+                &self.device,
+                &self.queue,
+                &mut self.sprite_vertex_buffer,
+                &mut self.sprite_vertex_capacity,
+                &self.sprite_vertices,
+                "sprite vertices",
+            );
+            self.vertex_caches.overlay.dirty = false;
+        }
+        if mesh_segments_changed {
+            assemble_mesh_3d_vertices(&self.vertex_caches, &mut self.mesh_vertices);
+            upload_vertices(
+                &self.device,
+                &self.queue,
+                &mut self.mesh_vertex_buffer,
+                &mut self.mesh_vertex_capacity,
+                &self.mesh_vertices,
+                "3D mesh vertices",
             );
         }
-        build_vertices_3d(world, &mut self.mesh_vertices, &mut self.color_cache);
-        upload_vertices(
-            &self.device,
-            &self.queue,
-            &mut self.sprite_vertex_buffer,
-            &mut self.sprite_vertex_capacity,
-            &self.sprite_vertices,
-            "sprite vertices",
-        );
-        upload_vertices(
-            &self.device,
-            &self.queue,
-            &mut self.mesh_vertex_buffer,
-            &mut self.mesh_vertex_capacity,
-            &self.mesh_vertices,
-            "3D mesh vertices",
-        );
         let aspect = self.config.width as f64 / self.config.height as f64;
         let camera = CameraUniform {
             view_projection: view_projection(&world.camera, aspect),
@@ -1159,6 +1313,13 @@ impl GpuRenderer {
             pass.draw(0..self.sprite_vertices.len() as u32, 0..1);
         }
         drop(pass);
+        // The editor UI composites over the finished scene passes, so it
+        // paints last, directly onto the surface view, before any capture
+        // copy. Golden mode never receives a pending frame, so captures stay
+        // byte-deterministic.
+        if let Some(frame) = self.pending_egui.take() {
+            self.paint_egui_frame(&mut encoder, &view, frame);
+        }
         if self.gpu_timing.as_ref().is_some_and(GpuTiming::is_sampling) {
             let timing = self.gpu_timing.as_ref().expect("GPU timing exists");
             encoder.resolve_query_set(&timing.query_set, 0..4, &timing.resolve_buffer, 0);
@@ -1182,6 +1343,64 @@ impl GpuRenderer {
         }
         self.queue.present(output);
         Ok(RenderStatus::Rendered)
+    }
+
+    /// Applies the handed-over egui frame's texture deltas and paints the
+    /// tessellated UI onto `view` in a load-op-load pass. The frame is
+    /// consumed here; freed texture ids are released after painting.
+    fn paint_egui_frame(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        (paint_jobs, mut textures_delta, pixels_per_point): EguiFrame,
+    ) {
+        for (texture_id, deltas) in textures_delta.set.iter() {
+            for delta in deltas {
+                self.egui_painter
+                    .update_texture(&self.device, &self.queue, *texture_id, delta);
+            }
+        }
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.config.width, self.config.height],
+            pixels_per_point,
+        };
+        let command_buffers = self.egui_painter.update_buffers(
+            &self.device,
+            &self.queue,
+            encoder,
+            &paint_jobs,
+            &screen,
+        );
+        // Paint-callback command buffers must be submitted before the pass
+        // that consumes their outputs; the editor UI produces none.
+        if !command_buffers.is_empty() {
+            self.queue.submit(command_buffers);
+        }
+        let mut egui_pass = encoder
+            .begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("egui editor pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            })
+            .forget_lifetime();
+        self.egui_painter
+            .render(&mut egui_pass, &paint_jobs, &screen);
+        for texture_id in textures_delta.free.iter() {
+            self.egui_painter.free_texture(texture_id);
+        }
+        // The deltas are applied; clear them so the drop check passes.
+        textures_delta.clear();
     }
 }
 
@@ -1355,30 +1574,305 @@ fn create_depth_view(
     texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
-fn build_vertices_3d(world: &World, vertices: &mut Vec<Vertex3d>, colors: &mut ColorCache) {
-    vertices.clear();
+/// Local-space corner points and normal of the built-in plane mesh.
+const PLANE_POINTS: [[f32; 3]; 4] = [
+    [-0.5, 0.0, 0.5],
+    [0.5, 0.0, 0.5],
+    [0.5, 0.0, -0.5],
+    [-0.5, 0.0, -0.5],
+];
+const PLANE_NORMAL: [f32; 3] = [0.0, 1.0, 0.0];
+
+/// Inputs that fully determine an entity's built-in 3D vertices. Metallic,
+/// roughness, and the source path do not affect built-in geometry, so they are
+/// deliberately excluded.
+#[derive(Clone, Debug, PartialEq)]
+struct Mesh3dSignature {
+    kind: MeshKind,
+    color: String,
+    transform: Transform3d,
+}
+
+impl Mesh3dSignature {
+    fn capture(model: &Model3d) -> Self {
+        Self {
+            kind: model.kind,
+            color: model.color.clone(),
+            transform: model.transform,
+        }
+    }
+
+    fn matches(&self, model: &Model3d) -> bool {
+        self.kind == model.kind && self.transform == model.transform && self.color == model.color
+    }
+}
+
+/// Inputs that fully determine a sprite's vertices. The layer only affects
+/// vertex order, not the sprite's own quad, so it is tracked by the sprite
+/// order comparison instead of the per-entity signature.
+#[derive(Clone, Debug, PartialEq)]
+struct SpriteSignature {
+    kind: SpriteKind,
+    color: String,
+    x: f64,
+    y: f64,
+    rotation: f64,
+    width: f64,
+    height: f64,
+}
+
+impl SpriteSignature {
+    fn capture(sprite: &Sprite, transform: &Transform) -> Self {
+        Self {
+            kind: sprite.kind,
+            color: sprite.color.clone(),
+            x: transform.x,
+            y: transform.y,
+            rotation: transform.rotation,
+            width: sprite.width,
+            height: sprite.height,
+        }
+    }
+
+    fn matches(&self, sprite: &Sprite, transform: &Transform) -> bool {
+        self.kind == sprite.kind
+            && self.width == sprite.width
+            && self.height == sprite.height
+            && self.x == transform.x
+            && self.y == transform.y
+            && self.rotation == transform.rotation
+            && self.color == sprite.color
+    }
+}
+
+/// Cached vertices contributed by one entity; `signature` gates whether the
+/// vertices still match the entity's current inputs.
+struct CachedSegment<S, V> {
+    signature: S,
+    vertices: Vec<V>,
+}
+
+/// Editor overlay quads and their prebuilt vertex data, rebuilt only when the
+/// incoming quad list differs field-for-field from the cached one.
+#[derive(Default)]
+struct OverlayCache {
+    quads: Vec<OverlayQuad>,
+    vertices: Vec<Vertex>,
+    dirty: bool,
+}
+
+/// CPU-side vertex caches for the sprite and built-in-3D paths. Entities
+/// rebuild their segment only when their inputs change; unchanged segments are
+/// concatenated into the frame vertex buffers verbatim in deterministic
+/// (entity id / layer) order.
+#[derive(Default)]
+struct VertexCaches {
+    sprites: BTreeMap<u64, CachedSegment<SpriteSignature, Vertex>>,
+    mesh_3d: BTreeMap<u64, CachedSegment<Mesh3dSignature, Vertex3d>>,
+    sprite_order: Vec<(i32, u64)>,
+    /// Previous frame's sprite order: a pure reorder (e.g. a layer edit)
+    /// invalidates the assembled buffer even when every segment is cached.
+    last_sprite_order: Vec<(i32, u64)>,
+    overlay: OverlayCache,
+}
+
+impl VertexCaches {
+    /// Stores the overlay quad list, rebuilding its vertices only when the
+    /// list differs field-for-field from the cached one.
+    fn set_overlay_quads(&mut self, quads: Vec<OverlayQuad>) {
+        if overlay_quads_equal(&quads, &self.overlay.quads) {
+            return;
+        }
+        self.overlay.vertices.clear();
+        for quad in &quads {
+            push_rectangle(
+                &mut self.overlay.vertices,
+                quad.x,
+                quad.y,
+                quad.width,
+                quad.height,
+                0.0,
+                quad.color,
+            );
+        }
+        self.overlay.quads = quads;
+        self.overlay.dirty = true;
+    }
+}
+
+/// Compares overlay quad lists field-for-field so identical re-submissions
+/// reuse the cached vertices instead of rebuilding them.
+fn overlay_quads_equal(left: &[OverlayQuad], right: &[OverlayQuad]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(a, b)| {
+            a.x == b.x
+                && a.y == b.y
+                && a.width == b.width
+                && a.height == b.height
+                && a.color == b.color
+        })
+}
+
+/// Rebuilds cached built-in 3D segments for entities whose inputs changed and
+/// prunes entities that despawned or switched to FBX models. Returns true when
+/// the assembled 3D vertex data changes this frame.
+fn rebuild_mesh_3d_segments(
+    world: &World,
+    caches: &mut VertexCaches,
+    colors: &mut ColorCache,
+) -> bool {
+    let mut dirty = false;
+    caches.mesh_3d.retain(|id, _| {
+        let keep = world.entities.get(id).is_some_and(|entity| {
+            entity
+                .model
+                .as_ref()
+                .is_some_and(|model| matches!(model.kind, MeshKind::Cube | MeshKind::Plane))
+        });
+        if !keep {
+            dirty = true;
+        }
+        keep
+    });
     for entity in world.entities.values() {
         let Some(model) = &entity.model else {
             continue;
         };
+        if let Some(segment) = caches.mesh_3d.get(&entity.id)
+            && segment.signature.matches(model)
+        {
+            continue;
+        }
+        let mut vertices = Vec::new();
         let color = colors.get(&model.color);
         match model.kind {
-            MeshKind::Cube => push_cube(vertices, &model.transform, color),
+            MeshKind::Cube => push_cube(&mut vertices, &model.transform, color),
             MeshKind::Plane => push_quad(
-                vertices,
-                [
-                    [-0.5, 0.0, 0.5],
-                    [0.5, 0.0, 0.5],
-                    [0.5, 0.0, -0.5],
-                    [-0.5, 0.0, -0.5],
-                ],
-                [0.0, 1.0, 0.0],
+                &mut vertices,
+                PLANE_POINTS,
+                PLANE_NORMAL,
                 &model.transform,
                 color,
             ),
             MeshKind::Fbx => {}
         }
+        if vertices.is_empty() {
+            continue;
+        }
+        caches.mesh_3d.insert(
+            entity.id,
+            CachedSegment {
+                signature: Mesh3dSignature::capture(model),
+                vertices,
+            },
+        );
+        dirty = true;
     }
+    dirty
+}
+
+/// Concatenates cached built-in 3D segments in entity-id order, matching the
+/// original per-frame world iteration order.
+fn assemble_mesh_3d_vertices(caches: &VertexCaches, vertices: &mut Vec<Vertex3d>) {
+    vertices.clear();
+    for segment in caches.mesh_3d.values() {
+        vertices.extend(segment.vertices.iter().copied());
+    }
+}
+
+/// Rebuilds cached sprite segments for entities whose inputs changed and
+/// prunes despawned ones. Returns true when the assembled sprite vertex data
+/// changes this frame (segment rebuilds, entity removals, or a layer reorder).
+fn rebuild_sprite_segments(
+    world: &World,
+    caches: &mut VertexCaches,
+    colors: &mut ColorCache,
+) -> bool {
+    let mut dirty = false;
+    caches.sprites.retain(|id, _| {
+        let keep = world
+            .entities
+            .get(id)
+            .is_some_and(|entity| entity.sprite.is_some());
+        if !keep {
+            dirty = true;
+        }
+        keep
+    });
+    caches.sprite_order.clear();
+    caches
+        .sprite_order
+        .extend(world.entities.values().filter_map(|entity| {
+            entity
+                .sprite
+                .as_ref()
+                .map(|sprite| (sprite.layer, entity.id))
+        }));
+    caches.sprite_order.sort_unstable();
+    if caches.sprite_order != caches.last_sprite_order {
+        dirty = true;
+    }
+    caches.last_sprite_order.clear();
+    caches
+        .last_sprite_order
+        .extend(caches.sprite_order.iter().copied());
+
+    for &(_, id) in caches.sprite_order.iter() {
+        let Some(entity) = world.entities.get(&id) else {
+            continue;
+        };
+        let Some(sprite) = entity.sprite.as_ref() else {
+            continue;
+        };
+        if let Some(segment) = caches.sprites.get(&id)
+            && segment.signature.matches(sprite, &entity.transform)
+        {
+            continue;
+        }
+        let mut vertices = Vec::new();
+        let color = colors.get(&sprite.color);
+        match sprite.kind {
+            SpriteKind::Rectangle => push_rectangle(
+                &mut vertices,
+                entity.transform.x,
+                entity.transform.y,
+                sprite.width,
+                sprite.height,
+                entity.transform.rotation,
+                color,
+            ),
+            SpriteKind::Circle => push_circle(
+                &mut vertices,
+                entity.transform.x,
+                entity.transform.y,
+                sprite.width,
+                sprite.height,
+                entity.transform.rotation,
+                color,
+            ),
+        }
+        caches.sprites.insert(
+            id,
+            CachedSegment {
+                signature: SpriteSignature::capture(sprite, &entity.transform),
+                vertices,
+            },
+        );
+        dirty = true;
+    }
+    dirty
+}
+
+/// Concatenates cached sprite segments in layer order, then the overlay
+/// vertices, reproducing the original per-frame build order exactly.
+fn assemble_sprite_vertices(caches: &VertexCaches, vertices: &mut Vec<Vertex>) {
+    vertices.clear();
+    for &(_, id) in caches.sprite_order.iter() {
+        if let Some(segment) = caches.sprites.get(&id) {
+            vertices.extend(segment.vertices.iter().copied());
+        }
+    }
+    vertices.extend(caches.overlay.vertices.iter().copied());
 }
 
 fn push_cube(vertices: &mut Vec<Vertex3d>, transform: &Transform3d, color: [f32; 4]) {
@@ -1724,53 +2218,6 @@ fn normalize(vector: [f32; 3]) -> [f32; 3] {
     [vector[0] / length, vector[1] / length, vector[2] / length]
 }
 
-fn build_vertices(
-    world: &World,
-    vertices: &mut Vec<Vertex>,
-    sprite_order: &mut Vec<(i32, u64)>,
-    colors: &mut ColorCache,
-) {
-    vertices.clear();
-    sprite_order.clear();
-    sprite_order.extend(world.entities.values().filter_map(|entity| {
-        entity
-            .sprite
-            .as_ref()
-            .map(|sprite| (sprite.layer, entity.id))
-    }));
-    sprite_order.sort_unstable();
-
-    for &(_, id) in sprite_order.iter() {
-        let Some(entity) = world.entities.get(&id) else {
-            continue;
-        };
-        let Some(sprite) = entity.sprite.as_ref() else {
-            continue;
-        };
-        let color = colors.get(&sprite.color);
-        match sprite.kind {
-            SpriteKind::Rectangle => push_rectangle(
-                vertices,
-                entity.transform.x,
-                entity.transform.y,
-                sprite.width,
-                sprite.height,
-                entity.transform.rotation,
-                color,
-            ),
-            SpriteKind::Circle => push_circle(
-                vertices,
-                entity.transform.x,
-                entity.transform.y,
-                sprite.width,
-                sprite.height,
-                entity.transform.rotation,
-                color,
-            ),
-        }
-    }
-}
-
 fn push_rectangle(
     vertices: &mut Vec<Vertex>,
     x: f64,
@@ -1901,9 +2348,22 @@ fn srgb_to_linear(value: u8) -> f32 {
     }
 }
 
+/// Moves `frame` into `slot` when it is the egui frame payload this build
+/// understands, replacing any still-pending frame. Payloads of any other type
+/// are rejected without touching the slot, so a UI/render egui-version
+/// mismatch degrades to "no UI layer this frame" instead of panicking.
+fn store_egui_frame(slot: &mut Option<EguiFrame>, frame: &mut dyn Any) -> bool {
+    let Some(output) = frame.downcast_mut::<EguiFrame>() else {
+        return false;
+    };
+    *slot = Some(std::mem::take(output));
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moni_core::engine::Entity;
 
     #[test]
     fn parse_color_matches_expected_channels() {
@@ -1935,5 +2395,356 @@ mod tests {
             cache.get(&format!("#{index:06x}"));
         }
         assert!(cache.entries.len() <= MAX_CACHED_COLORS);
+    }
+
+    fn mesh_key(source: &str, color: &str, revision: u64) -> FbxMeshKey {
+        FbxMeshKey {
+            source: source.to_string(),
+            color: color.to_string(),
+            revision,
+        }
+    }
+
+    fn cube_entity(id: u64, transform: Transform3d, color: &str) -> Entity {
+        Entity {
+            id,
+            name: format!("entity-{id}"),
+            transform: Transform::default(),
+            sprite: None,
+            model: Some(Model3d {
+                kind: MeshKind::Cube,
+                source: None,
+                transform,
+                color: color.to_string(),
+                metallic: 0.0,
+                roughness: 0.5,
+            }),
+            script: None,
+            extensions: BTreeMap::new(),
+        }
+    }
+
+    fn plane_entity(id: u64, transform: Transform3d, color: &str) -> Entity {
+        Entity {
+            id,
+            name: format!("entity-{id}"),
+            transform: Transform::default(),
+            sprite: None,
+            model: Some(Model3d {
+                kind: MeshKind::Plane,
+                source: None,
+                transform,
+                color: color.to_string(),
+                metallic: 0.0,
+                roughness: 0.5,
+            }),
+            script: None,
+            extensions: BTreeMap::new(),
+        }
+    }
+
+    fn sprite_entity(id: u64, layer: i32, width: f64, color: &str) -> Entity {
+        Entity {
+            id,
+            name: format!("entity-{id}"),
+            transform: Transform::default(),
+            sprite: Some(Sprite {
+                kind: SpriteKind::Rectangle,
+                width,
+                height: 16.0,
+                color: color.to_string(),
+                layer,
+            }),
+            model: None,
+            script: None,
+            extensions: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn fbx_mesh_keys_distinguish_all_inputs() {
+        let base = mesh_key("a.fbx", "#ffffff", 1);
+        assert_eq!(base, mesh_key("a.fbx", "#ffffff", 1));
+        assert_ne!(base, mesh_key("b.fbx", "#ffffff", 1));
+        assert_ne!(base, mesh_key("a.fbx", "#ff0000", 1));
+        assert_ne!(base, mesh_key("a.fbx", "#ffffff", 2));
+    }
+
+    #[test]
+    fn shared_mesh_cache_releases_entries_at_zero_references() {
+        let mut cache = SharedMeshCache::default();
+        let alpha = mesh_key("a.fbx", "#ffffff", 1);
+        let beta = mesh_key("b.fbx", "#ffffff", 1);
+        cache.acquire(alpha.clone(), || 7_u32);
+        cache.acquire(alpha.clone(), || {
+            panic!("the second acquire must reuse the existing entry")
+        });
+        cache.acquire(beta.clone(), || 9_u32);
+        assert_eq!(cache.get(&alpha), Some(&7));
+        assert_eq!(cache.get(&beta), Some(&9));
+
+        cache.release(&alpha);
+        assert_eq!(cache.get(&alpha), Some(&7), "one reference remains");
+        cache.release(&alpha);
+        assert_eq!(cache.get(&alpha), None, "last release drops the entry");
+        assert_eq!(cache.get(&beta), Some(&9), "other keys are untouched");
+
+        // Releasing an unknown key is a no-op.
+        cache.release(&alpha);
+        assert_eq!(cache.get(&beta), Some(&9));
+    }
+
+    fn entity_model(world: &mut World, id: u64) -> &mut Model3d {
+        world
+            .entities
+            .get_mut(&id)
+            .and_then(|entity| entity.model.as_mut())
+            .expect("entity model exists")
+    }
+
+    #[test]
+    fn mesh_3d_segments_rebuild_only_on_signature_change() {
+        let mut world = World::default();
+        world.entities.insert(
+            1,
+            cube_entity(
+                1,
+                Transform3d {
+                    position: Vector3 {
+                        x: 1.0,
+                        y: 2.0,
+                        z: 3.0,
+                    },
+                    rotation: Vector3::default(),
+                    scale: Vector3::ONE,
+                },
+                "#ff0000",
+            ),
+        );
+        let mut caches = VertexCaches::default();
+        let mut colors = ColorCache::default();
+        assert!(rebuild_mesh_3d_segments(&world, &mut caches, &mut colors));
+        assert!(!rebuild_mesh_3d_segments(&world, &mut caches, &mut colors));
+
+        // Metallic and roughness are not vertex inputs and must not trigger a
+        // rebuild.
+        entity_model(&mut world, 1).metallic = 1.0;
+        assert!(!rebuild_mesh_3d_segments(&world, &mut caches, &mut colors));
+
+        // A transform change triggers exactly one rebuild.
+        entity_model(&mut world, 1).transform.position.x = 5.0;
+        assert!(rebuild_mesh_3d_segments(&world, &mut caches, &mut colors));
+        assert!(!rebuild_mesh_3d_segments(&world, &mut caches, &mut colors));
+
+        // A color change triggers exactly one rebuild.
+        entity_model(&mut world, 1).color = "#00ff00".to_string();
+        assert!(rebuild_mesh_3d_segments(&world, &mut caches, &mut colors));
+        assert!(!rebuild_mesh_3d_segments(&world, &mut caches, &mut colors));
+
+        // Despawn frees the cached segment.
+        world.entities.remove(&1);
+        assert!(rebuild_mesh_3d_segments(&world, &mut caches, &mut colors));
+        assert!(!rebuild_mesh_3d_segments(&world, &mut caches, &mut colors));
+        assert!(caches.mesh_3d.is_empty());
+
+        // Re-adding the entity rebuilds once (cache miss).
+        world
+            .entities
+            .insert(1, cube_entity(1, Transform3d::default(), "#ff0000"));
+        assert!(rebuild_mesh_3d_segments(&world, &mut caches, &mut colors));
+        assert!(!rebuild_mesh_3d_segments(&world, &mut caches, &mut colors));
+
+        // Switching the kind to plane rebuilds once.
+        entity_model(&mut world, 1).kind = MeshKind::Plane;
+        assert!(rebuild_mesh_3d_segments(&world, &mut caches, &mut colors));
+        assert!(!rebuild_mesh_3d_segments(&world, &mut caches, &mut colors));
+
+        // Switching to an FBX model drops the segment entirely.
+        entity_model(&mut world, 1).kind = MeshKind::Fbx;
+        assert!(rebuild_mesh_3d_segments(&world, &mut caches, &mut colors));
+        assert!(caches.mesh_3d.is_empty());
+    }
+
+    #[test]
+    fn cached_mesh_3d_vertices_match_direct_construction() {
+        let transform = Transform3d {
+            position: Vector3 {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0,
+            },
+            rotation: Vector3 {
+                x: 0.1,
+                y: 0.2,
+                z: 0.3,
+            },
+            scale: Vector3 {
+                x: 2.0,
+                y: 3.0,
+                z: 4.0,
+            },
+        };
+        let mut world = World::default();
+        world
+            .entities
+            .insert(1, cube_entity(1, transform, "#4f8cff"));
+        world
+            .entities
+            .insert(2, plane_entity(2, transform, "#10141f"));
+
+        let mut caches = VertexCaches::default();
+        let mut colors = ColorCache::default();
+        assert!(rebuild_mesh_3d_segments(&world, &mut caches, &mut colors));
+        let mut assembled = Vec::new();
+        assemble_mesh_3d_vertices(&caches, &mut assembled);
+
+        // Expected vertices in entity-id order with directly computed values.
+        let mut expected = Vec::new();
+        push_cube(&mut expected, &transform, parse_color("#4f8cff"));
+        push_quad(
+            &mut expected,
+            PLANE_POINTS,
+            PLANE_NORMAL,
+            &transform,
+            parse_color("#10141f"),
+        );
+        assert_eq!(assembled, expected);
+    }
+
+    #[test]
+    fn sprite_segments_track_changes_and_layer_reorders() {
+        let mut world = World::default();
+        world
+            .entities
+            .insert(1, sprite_entity(1, 0, 32.0, "#ffffff"));
+        world
+            .entities
+            .insert(2, sprite_entity(2, 1, 48.0, "#10141f"));
+        let mut caches = VertexCaches::default();
+        let mut colors = ColorCache::default();
+        assert!(rebuild_sprite_segments(&world, &mut caches, &mut colors));
+        assert!(!rebuild_sprite_segments(&world, &mut caches, &mut colors));
+
+        // Swapping layers is a pure reorder: segments stay cached but the
+        // assembled order changes, so the frame is marked dirty exactly once.
+        world
+            .entities
+            .get_mut(&1)
+            .unwrap()
+            .sprite
+            .as_mut()
+            .unwrap()
+            .layer = 2;
+        assert!(rebuild_sprite_segments(&world, &mut caches, &mut colors));
+        assert_eq!(caches.sprite_order, [(1, 2_u64), (2, 1_u64)]);
+        assert!(!rebuild_sprite_segments(&world, &mut caches, &mut colors));
+
+        // A width change rebuilds the entity's segment.
+        world
+            .entities
+            .get_mut(&2)
+            .unwrap()
+            .sprite
+            .as_mut()
+            .unwrap()
+            .width = 64.0;
+        assert!(rebuild_sprite_segments(&world, &mut caches, &mut colors));
+        assert!(!rebuild_sprite_segments(&world, &mut caches, &mut colors));
+
+        // Despawn frees the segment and changes the order once.
+        world.entities.remove(&2);
+        assert!(rebuild_sprite_segments(&world, &mut caches, &mut colors));
+        assert!(!rebuild_sprite_segments(&world, &mut caches, &mut colors));
+        assert_eq!(caches.sprites.len(), 1, "entity 1's segment remains");
+    }
+
+    #[test]
+    fn sprite_vertices_follow_layer_order_then_overlay() {
+        let mut world = World::default();
+        world
+            .entities
+            .insert(1, sprite_entity(1, 5, 32.0, "#ffffff"));
+        world
+            .entities
+            .insert(2, sprite_entity(2, 1, 32.0, "#ffffff"));
+        let mut caches = VertexCaches::default();
+        let mut colors = ColorCache::default();
+        rebuild_sprite_segments(&world, &mut caches, &mut colors);
+        caches.set_overlay_quads(vec![OverlayQuad {
+            x: 0.0,
+            y: 0.0,
+            width: 4.0,
+            height: 4.0,
+            color: [0.5, 0.5, 0.5, 0.5],
+        }]);
+        let mut assembled = Vec::new();
+        assemble_sprite_vertices(&caches, &mut assembled);
+
+        // Entity 2 (layer 1), then entity 1 (layer 5), then the overlay quads.
+        let white = parse_color("#ffffff");
+        let mut expected = Vec::new();
+        push_rectangle(&mut expected, 0.0, 0.0, 32.0, 16.0, 0.0, white);
+        push_rectangle(&mut expected, 0.0, 0.0, 32.0, 16.0, 0.0, white);
+        push_rectangle(&mut expected, 0.0, 0.0, 4.0, 4.0, 0.0, [0.5, 0.5, 0.5, 0.5]);
+        assert_eq!(assembled, expected);
+    }
+
+    #[test]
+    fn overlay_cache_reuses_identical_quad_lists() {
+        let mut caches = VertexCaches::default();
+        let quads = vec![OverlayQuad {
+            x: 1.0,
+            y: 2.0,
+            width: 3.0,
+            height: 4.0,
+            color: [0.1, 0.2, 0.3, 0.4],
+        }];
+        caches.set_overlay_quads(quads.clone());
+        assert!(caches.overlay.dirty);
+        let first_vertices = caches.overlay.vertices.clone();
+        caches.overlay.dirty = false;
+
+        caches.set_overlay_quads(quads.clone());
+        assert!(
+            !caches.overlay.dirty,
+            "identical quad lists keep the cached vertices"
+        );
+        assert_eq!(caches.overlay.vertices, first_vertices);
+
+        let mut changed = quads;
+        changed[0].x = 9.0;
+        caches.set_overlay_quads(changed);
+        assert!(caches.overlay.dirty, "a changed list rebuilds");
+    }
+
+    #[test]
+    fn egui_frame_slot_accepts_only_matching_payloads() {
+        let mut slot = None;
+
+        // A non-egui payload is rejected without touching the slot.
+        let mut alien = 42_u64;
+        assert!(!store_egui_frame(&mut slot, &mut alien));
+        assert!(slot.is_none());
+
+        // An egui frame payload is drained out of the caller's variable and
+        // moved into the slot.
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::splat(4.0));
+        let mut frame: EguiFrame = (Vec::new(), egui::TexturesDelta::default(), 1.0);
+        frame.0.push(egui::ClippedPrimitive {
+            clip_rect: rect,
+            primitive: egui::epaint::Primitive::Mesh(egui::Mesh {
+                indices: vec![0, 1, 2],
+                vertices: Vec::new(),
+                texture_id: egui::TextureId::Managed(0),
+            }),
+        });
+        assert!(store_egui_frame(&mut slot, &mut frame));
+        assert!(frame.0.is_empty(), "the payload was consumed");
+        assert_eq!(slot.as_ref().expect("frame was stored").0.len(), 1);
+
+        // A newer frame replaces the still-pending one.
+        let mut next: EguiFrame = (Vec::new(), egui::TexturesDelta::default(), 1.0);
+        assert!(store_egui_frame(&mut slot, &mut next));
+        assert_eq!(slot.as_ref().expect("frame was replaced").0.len(), 0);
     }
 }

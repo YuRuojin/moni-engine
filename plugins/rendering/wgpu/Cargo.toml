@@ -10,6 +10,10 @@ path = "mod.rs"
 serde_json = "1"
 anyhow = "1"
 bytemuck = { version = "1", features = ["derive"] }
+# egui types for the type-erased editor-UI frame hand-off; egui-wgpu 0.37
+# re-exports wgpu but not egui itself.
+egui = "0.37"
+egui-wgpu = "0.37"
 moni-assets = { path = "../../assets" }
 moni-core = { path = "../../../crates/moni-core" }
 pollster = "1"
