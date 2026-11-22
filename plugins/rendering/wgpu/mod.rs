@@ -27,6 +27,17 @@ const INITIAL_MESH_VERTEX_CAPACITY: usize = 512;
 const SHADOW_MAP_SIZE: u32 = 1_024;
 const MAX_POINT_LIGHTS: usize = 8;
 const MAX_CACHED_COLORS: usize = 4_096;
+/// Editor ground-grid geometry: one line per spacing step across the extent
+/// on both X and Z, all at y = 0.
+const GRID_CELLS: i32 = 20;
+const GRID_SPACING: f32 = 1.0;
+const GRID_EXTENT: f32 = GRID_CELLS as f32 * GRID_SPACING;
+/// Grid line colors in linear space (the sRGB surface encodes them). The X
+/// and Z axis lines are tinted so viewport orientation stays readable; every
+/// other line is a dim neutral.
+const GRID_LINE_COLOR: [f32; 4] = [0.16, 0.18, 0.22, 0.55];
+const GRID_X_AXIS_COLOR: [f32; 4] = [0.80, 0.22, 0.20, 0.90];
+const GRID_Z_AXIS_COLOR: [f32; 4] = [0.22, 0.42, 0.85, 0.90];
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
@@ -278,6 +289,12 @@ pub struct GpuRenderer {
     /// Editor UI frame handed over through `set_egui_frame`; consumed and
     /// freed by the next rendered frame.
     pending_egui: Option<EguiFrame>,
+    /// Editor viewport ground grid: dedicated LineList pipeline, static
+    /// lattice buffer, and visibility state. Invisible by default; only
+    /// `set_grid_visible` flips the flag, so golden captures never draw it.
+    grid_pipeline: wgpu::RenderPipeline,
+    grid_vertex_buffer: wgpu::Buffer,
+    grid: GridState,
 }
 
 /// The editor UI frame payload crossing the type-erased render API: the
@@ -642,6 +659,58 @@ impl GpuRenderer {
             multiview_mask: None,
             cache: None,
         });
+        // The ground grid reuses the 3D camera bind group (its shader reads
+        // only the camera uniform) with its own LineList pipeline: unlit,
+        // depth-tested, and no depth write so it never disturbs transparent
+        // sorting.
+        let grid_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("grid pipeline layout"),
+            bind_group_layouts: &[Some(&camera_layout)],
+            immediate_size: 0,
+        });
+        let grid_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("moni grid shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("grid.wgsl").into()),
+        });
+        let grid_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("grid pipeline"),
+            layout: Some(&grid_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &grid_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[Some(Vertex3d::LAYOUT)],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &grid_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
         let shadow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("moni shadow shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shadow.wgsl").into()),
@@ -695,6 +764,15 @@ impl GpuRenderer {
             size_of::<Vertex3d>(),
             "3D mesh vertices",
         );
+        // The editor ground grid is a static lattice built once at start; it
+        // draws with the grid pipeline and stays invisible until an editor
+        // opts in through the render API.
+        let grid = GridState::new();
+        let grid_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("editor grid vertices"),
+            contents: bytemuck::cast_slice(&grid.vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
 
         let gpu_timing = timestamp_features
             .contains(wgpu::Features::TIMESTAMP_QUERY)
@@ -739,6 +817,9 @@ impl GpuRenderer {
             last_preparation_time: Duration::ZERO,
             egui_painter,
             pending_egui: None,
+            grid_pipeline,
+            grid_vertex_buffer,
+            grid,
         };
         renderer.prepare_fbx_objects(world, true)?;
         Ok(renderer)
@@ -786,6 +867,12 @@ impl GpuRenderer {
     /// build understands; the frame slot then keeps its previous content.
     pub fn set_egui_frame(&mut self, frame: &mut dyn Any) -> bool {
         store_egui_frame(&mut self.pending_egui, frame)
+    }
+
+    /// Toggles the editor ground grid. Always returns `true`: the renderer
+    /// owns the static lattice, so the flag applies from the next frame on.
+    pub fn set_grid_visible(&mut self, visible: bool) -> bool {
+        self.grid.set_visible(visible)
     }
 
     fn prepare_capture(
@@ -1305,6 +1392,18 @@ impl GpuRenderer {
             pass.set_bind_group(1, &object.model_bind_group, &[]);
             pass.set_vertex_buffer(0, object.vertex_buffer.slice(..));
             pass.draw(0..object.vertex_count, 0..1);
+        }
+        // The ground grid draws inside the main pass — keeping it within the
+        // main-pass GPU timestamp window — after scene geometry so entities
+        // occlude it (depth-tested, no depth write), and before sprites,
+        // overlay, and egui so tool layers stay on top. The flag is off by
+        // default and only the render API flips it, so golden captures never
+        // draw the grid.
+        if self.grid.visible {
+            pass.set_pipeline(&self.grid_pipeline);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_vertex_buffer(0, self.grid_vertex_buffer.slice(..));
+            pass.draw(0..self.grid.vertices.len() as u32, 0..1);
         }
         if !self.sprite_vertices.is_empty() {
             pass.set_pipeline(&self.pipeline);
@@ -2294,6 +2393,76 @@ fn rotate_point(x: f64, y: f64, local_x: f64, local_y: f64, rotation: f64) -> [f
     ]
 }
 
+/// Appends one line-list segment: two vertices at y = 0 with the up normal,
+/// matching the shared Vertex3d layout the grid pipeline consumes.
+fn push_grid_line(vertices: &mut Vec<Vertex3d>, from: [f32; 3], to: [f32; 3], color: [f32; 4]) {
+    for position in [from, to] {
+        vertices.push(Vertex3d {
+            position,
+            normal: [0.0, 1.0, 0.0],
+            color,
+        });
+    }
+}
+
+/// Builds the editor ground-grid line-list vertices: one line per
+/// `GRID_SPACING` across ±`GRID_EXTENT` on both X and Z at y = 0, with the
+/// X axis line (at z = 0) and Z axis line (at x = 0) tinted for orientation.
+/// The lattice is deterministic and static, so the renderer builds it once at
+/// start and the grid pipeline consumes the buffer without index data.
+fn build_grid_vertices() -> Vec<Vertex3d> {
+    let per_direction = 2 * GRID_CELLS as usize + 1;
+    let mut vertices = Vec::with_capacity(4 * per_direction);
+    for step in -GRID_CELLS..=GRID_CELLS {
+        let offset = step as f32 * GRID_SPACING;
+        push_grid_line(
+            &mut vertices,
+            [offset, 0.0, -GRID_EXTENT],
+            [offset, 0.0, GRID_EXTENT],
+            if step == 0 {
+                GRID_Z_AXIS_COLOR
+            } else {
+                GRID_LINE_COLOR
+            },
+        );
+        push_grid_line(
+            &mut vertices,
+            [-GRID_EXTENT, 0.0, offset],
+            [GRID_EXTENT, 0.0, offset],
+            if step == 0 {
+                GRID_X_AXIS_COLOR
+            } else {
+                GRID_LINE_COLOR
+            },
+        );
+    }
+    vertices
+}
+
+/// Editor viewport ground grid: the static lattice and its visibility flag.
+/// The flag is off by default and only `set_grid_visible` flips it, so scenes
+/// and golden captures never draw the grid unless an editor opts in.
+struct GridState {
+    visible: bool,
+    vertices: Vec<Vertex3d>,
+}
+
+impl GridState {
+    fn new() -> Self {
+        Self {
+            visible: false,
+            vertices: build_grid_vertices(),
+        }
+    }
+
+    /// Flips the visibility flag; always succeeds because the lattice is
+    /// static and toggling never rebuilds GPU resources.
+    fn set_visible(&mut self, visible: bool) -> bool {
+        self.visible = visible;
+        true
+    }
+}
+
 fn parse_color(value: &str) -> [f32; 4] {
     let value = value.strip_prefix('#').unwrap_or(value);
     let red = color_channel(value, 0);
@@ -2746,5 +2915,87 @@ mod tests {
         let mut next: EguiFrame = (Vec::new(), egui::TexturesDelta::default(), 1.0);
         assert!(store_egui_frame(&mut slot, &mut next));
         assert_eq!(slot.as_ref().expect("frame was replaced").0.len(), 0);
+    }
+
+    #[test]
+    fn grid_vertices_form_a_symmetric_axis_highlighted_lattice() {
+        let vertices = build_grid_vertices();
+        let per_direction = 2 * GRID_CELLS as usize + 1;
+        assert_eq!(
+            vertices.len(),
+            4 * per_direction,
+            "two endpoints per line, 41 lines along each of X and Z"
+        );
+        for vertex in &vertices {
+            assert_eq!(vertex.position[1], 0.0, "the lattice lies at y = 0");
+            assert_eq!(vertex.normal, [0.0, 1.0, 0.0]);
+        }
+
+        let mut x_lines = 0;
+        let mut z_lines = 0;
+        let mut x_axis_lines = 0;
+        let mut z_axis_lines = 0;
+        for pair in vertices.chunks_exact(2) {
+            let (from, to) = (pair[0].position, pair[1].position);
+            assert_eq!(
+                pair[0].color, pair[1].color,
+                "both endpoints share the line color"
+            );
+            let along_x = from[2] == to[2];
+            let along_z = from[0] == to[0];
+            assert_ne!(
+                along_x, along_z,
+                "each line runs along exactly one horizontal axis"
+            );
+            let (fixed, travel) = if along_x {
+                x_lines += 1;
+                (from[2], (from[0], to[0]))
+            } else {
+                z_lines += 1;
+                (from[0], (from[2], to[2]))
+            };
+            assert_eq!(
+                travel,
+                (-GRID_EXTENT, GRID_EXTENT),
+                "lines span the symmetric extent"
+            );
+            let steps = fixed / GRID_SPACING;
+            assert!(
+                steps.abs() <= GRID_CELLS as f32 && (steps - steps.round()).abs() < 1e-6,
+                "lines sit on spacing steps inside the extent"
+            );
+            if pair[0].color == GRID_X_AXIS_COLOR {
+                x_axis_lines += 1;
+                assert!(
+                    along_x && fixed == 0.0,
+                    "the X axis line runs along X at z = 0"
+                );
+            } else if pair[0].color == GRID_Z_AXIS_COLOR {
+                z_axis_lines += 1;
+                assert!(
+                    along_z && fixed == 0.0,
+                    "the Z axis line runs along Z at x = 0"
+                );
+            } else {
+                assert_eq!(pair[0].color, GRID_LINE_COLOR);
+            }
+        }
+        assert_eq!(x_lines, per_direction);
+        assert_eq!(z_lines, per_direction);
+        assert_eq!(x_axis_lines, 1, "exactly one highlighted X axis line");
+        assert_eq!(z_axis_lines, 1, "exactly one highlighted Z axis line");
+    }
+
+    #[test]
+    fn grid_state_defaults_off_and_set_visible_flips_it() {
+        let mut grid = GridState::new();
+        assert!(!grid.visible, "the grid is invisible by default");
+        assert!(
+            grid.set_visible(true),
+            "the static lattice always accepts the toggle"
+        );
+        assert!(grid.visible);
+        assert!(grid.set_visible(false));
+        assert!(!grid.visible);
     }
 }

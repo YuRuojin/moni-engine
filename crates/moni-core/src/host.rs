@@ -69,6 +69,15 @@ pub trait RenderPluginApi {
         let _ = frame;
         false
     }
+    /// Toggles the editor's viewport ground grid (an XZ line lattice at
+    /// y = 0). Off by default; golden captures never enable it. This is the
+    /// same opt-in tool-surface pattern as [`RenderPluginApi::set_egui_frame`]:
+    /// plugins without a grid keep the `false` default, and a not-started
+    /// renderer also reports `false`.
+    fn set_grid_visible(&mut self, visible: bool) -> bool {
+        let _ = visible;
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

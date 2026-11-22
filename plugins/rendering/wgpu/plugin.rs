@@ -89,6 +89,12 @@ impl RenderPluginApi for RenderPlugin {
             .as_mut()
             .is_some_and(|renderer| renderer.set_egui_frame(frame))
     }
+
+    fn set_grid_visible(&mut self, visible: bool) -> bool {
+        self.renderer
+            .as_mut()
+            .is_some_and(|renderer| renderer.set_grid_visible(visible))
+    }
 }
 
 impl Plugin for RenderPlugin {
@@ -249,6 +255,15 @@ mod tests {
         assert!(
             !plugin.set_egui_frame(&mut frame),
             "a matching payload is still rejected while the renderer is not started"
+        );
+    }
+
+    #[test]
+    fn set_grid_visible_needs_a_started_renderer() {
+        let mut plugin = RenderPlugin::new(false, false, false);
+        assert!(
+            !plugin.set_grid_visible(true),
+            "a renderer that is not started has no grid to toggle"
         );
     }
 }
