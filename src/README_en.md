@@ -8,7 +8,7 @@
 
 | File/directory | Responsibility |
 |---|---|
-| `main.rs` | CLI subcommands, profile listing, and workspace path restrictions |
+| `main.rs` | CLI subcommands, editor project detection/profile composition, profile listing, and workspace path restrictions |
 | `bootstrap.rs` | Static plugin factory and `serve_session()`: the composition root wires a profile's plugins into a session |
 | `client.rs` | `winit` window, redraw, catch-up stepping, and render-benchmark capture on top of `RuntimeSession` |
 | `fuzz.rs` | Structured in-process parser fuzzing |
@@ -17,7 +17,7 @@
 | [`crates/moni-core/src/host.rs`](../crates/moni-core/README.md) | Plugin host: dependency-scheduled systems (cached), access enforcement, service registry, plugin commands, and cascade unregistration |
 | [`crates/moni-core/src/protocol.rs`](../crates/moni-core/README.md) | NDJSON protocol, atomic batches, dry runs, capability descriptions, and query/snapshot I/O |
 | [`plugins/rendering/wgpu/`](../plugins/rendering/wgpu/README_en.md) | `wgpu` device, 2D/3D/shadow pipelines, FBX loading, model matrices, culling, and GPU timestamps |
-| [`plugins/editor/scene-viewer/`](../plugins/editor/scene-viewer/README_en.md) | Read-only scene viewer, camera controls through the command API, and performance/hierarchy overlay |
+| [`plugins/editor/scene-viewer/`](../plugins/editor/scene-viewer/README_en.md) | Editable scene editor (project detection, panels, play mode), camera controls through the command API, and performance/hierarchy overlay |
 | [`plugins/scripting/quickjs/`](../plugins/scripting/quickjs/README_en.md) | Persistent QuickJS hosts, script contexts, limits, and command collection |
 | [`profiles/`](../profiles/README.md) | Named profiles (including `serve`), bundles, and effective trees |
 

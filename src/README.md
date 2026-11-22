@@ -8,7 +8,7 @@
 
 | 文件/目录 | 职责 |
 |---|---|
-| `main.rs` | CLI 子命令、profile 列表和 workspace 路径限制 |
+| `main.rs` | CLI 子命令、编辑器工程检测/profile 合成、profile 列表和 workspace 路径限制 |
 | `bootstrap.rs` | 静态插件工厂与 `serve_session()`：组合根把 profile 的插件装配进会话 |
 | `client.rs` | `winit` 窗口、重绘、追帧推进和渲染基准采集，基于 `RuntimeSession` |
 | `fuzz.rs` | 结构化进程内解析器模糊测试 |
@@ -17,7 +17,7 @@
 | [`crates/moni-core/src/host.rs`](../crates/moni-core/README.md) | 插件宿主：依赖调度（含缓存）、访问强制、服务注册表、插件命令和级联卸载 |
 | [`crates/moni-core/src/protocol.rs`](../crates/moni-core/README.md) | NDJSON 协议、原子批处理、dry-run、能力描述和查询/快照读写 |
 | [`plugins/rendering/wgpu/`](../plugins/rendering/wgpu/README.md) | `wgpu` 设备、2D/3D/阴影管线、FBX 加载、模型矩阵、剔除和 GPU 时间戳 |
-| [`plugins/editor/scene-viewer/`](../plugins/editor/scene-viewer/README.md) | 只读场景查看器、经命令 API 的相机控制和性能/层级 overlay |
+| [`plugins/editor/scene-viewer/`](../plugins/editor/scene-viewer/README.md) | 可编辑场景编辑器（工程检测、面板、播放模式）、经命令 API 的相机控制和性能/层级 overlay |
 | [`plugins/scripting/quickjs/`](../plugins/scripting/quickjs/README.md) | 持久 QuickJS 宿主、脚本上下文、限制和命令收集 |
 | [`profiles/`](../profiles/README.md) | 命名 profile（含 `serve`）、bundles 和有效树 |
 

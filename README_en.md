@@ -17,7 +17,7 @@ Moni Engine is a lightweight 2D/3D engine kernel written in Rust. Its goal is a 
 - Independent `.mngp` game projects, lockfiles, a minimal template, and the `new/run/doctor` CLI.
 - Bounded asynchronous assets, reference/cancellation/timeout/cache management, `.mnec` cooked meshes, and concrete official plugin directories.
 - Host-enforced permissions, permission-diff acceptance, SHA-256 manifest integrity, lockfile rollback, isolated imports, golden and compatibility/stability tests.
-- An editable scene editor (egui hierarchy tree, schema-driven inspector, undo/redo, atomic saves), play mode (pre-play snapshot with forward restore and a play-time editing lock), and an asset browser (open scenes, spawn models, attach scripts), CPU benchmarks, and main/shadow-pass GPU timestamps.
+- A project-based editable scene editor (automatic project profile and main scene, recent projects, unsaved-changes modal, TypeScript errors located to entities; egui hierarchy tree, schema-driven inspector, undo/redo, atomic saves), play mode (pre-play snapshot with forward restore and a play-time editing lock), an asset browser, and viewport editing (click-select sync, 3-axis move gizmo, grid snapping, camera orbit/pan), CPU benchmarks, and main/shadow-pass GPU timestamps.
 - A `moni mcp` MCP server: a thin control-plane adapter whose first 14 high-level tools all route through session command dispatch with NDJSON-identical semantics.
 - GitHub Actions CI: format check, workspace tests, TypeScript checks, the display-free compatibility subset and template E2E (ubuntu), plus a Windows test-parity job.
 - TypeScript declarations and 2D/3D examples.

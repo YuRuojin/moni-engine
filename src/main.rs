@@ -60,7 +60,7 @@ fn run() -> anyhow::Result<()> {
         Some("fuzz") => fuzz::run(args.collect()),
         Some("profile") => profile_command(args.collect()),
         Some("client") => client::run(args.collect()),
-        Some("editor") => editor_command(),
+        Some("editor") => editor_command(args.collect()),
         Some("scene") => scene_roundtrip(args.collect()),
         Some("benchmark") => benchmark::run(args.collect()),
         Some("demo") => demo(args.collect()),
@@ -75,7 +75,7 @@ fn print_help() -> anyhow::Result<()> {
   new PATH                  Create an independent game repository\n  run [--frames N]          Build and run the project in the current directory\n  doctor [--update-lock] [--rollback-lock] [--accept-permissions]
                             Validate project, scene, profile, and lockfile\n  fuzz [--target cooked|scene|fbx] [--iterations N] [--seed S]
                             Structured in-process parser fuzzing
-  capabilities              Print the machine-readable control schema\n  serve                     Serve NDJSON requests on stdin/stdout\n  mcp [--scene PATH] [--project]\n                            Serve MCP tools over stdio (thin adapter over the\n                            same RuntimeSession command path as serve)\n  headless [--profile NAME] [--scene PATH]\n                            Resolve and inspect a headless profile\n  profile [list|dump] [--profile NAME] [--patch ID=on|off] [--plugin-config ID=JSON]\n                            Inspect profiles and effective plugin trees\n  client [--scene 2d|3d] [--script PATH] [--frames N]\n         [--benchmark --warmup N --output PATH] [--hot-reload]\n                            Open the winit/wgpu client\n  editor [--scene PATH] [--frames N] [--hot-reload]\n                            Open the editable .mnsc scene editor (hierarchy + inspector)\n  scene PATH [--output PATH] [--name NAME]\n                            Migrate and round-trip a .mnsc scene\n  benchmark [--scene 2d|3d] [--script PATH] [--frames N]\n            [--warmup N] [--output PATH]\n                            Measure release simulation ticks\n  demo [--ticks N] [--output PATH] [--snapshot PATH] [--script PATH]\n\nScript workflow:\n  npm install\n  npm run build\n  cargo run -- client\n  cargo run -- client --scene 3d\n  npm run benchmark"
+  capabilities              Print the machine-readable control schema\n  serve                     Serve NDJSON requests on stdin/stdout\n  mcp [--scene PATH] [--project]\n                            Serve MCP tools over stdio (thin adapter over the\n                            same RuntimeSession command path as serve)\n  headless [--profile NAME] [--scene PATH]\n                            Resolve and inspect a headless profile\n  profile [list|dump] [--profile NAME] [--patch ID=on|off] [--plugin-config ID=JSON]\n                            Inspect profiles and effective plugin trees\n  client [--scene 2d|3d] [--script PATH] [--frames N]\n         [--benchmark --warmup N --output PATH] [--hot-reload]\n                            Open the winit/wgpu client\n  editor [--project PATH] [--scene PATH] [--frames N] [--hot-reload]\n                            Open the editable .mnsc scene editor; uses a\n                            game.mngp project in the working directory\n  scene PATH [--output PATH] [--name NAME]\n                            Migrate and round-trip a .mnsc scene\n  benchmark [--scene 2d|3d] [--script PATH] [--frames N]\n            [--warmup N] [--output PATH]\n                            Measure release simulation ticks\n  demo [--ticks N] [--output PATH] [--snapshot PATH] [--script PATH]\n\nScript workflow:\n  npm install\n  npm run build\n  cargo run -- client\n  cargo run -- client --scene 3d\n  npm run benchmark"
     );
     Ok(())
 }
@@ -191,8 +191,12 @@ fn project_new(args: Vec<String>) -> anyhow::Result<()> {
     } else {
         env::current_dir()?.join(raw)
     };
+    // Only clean up directories this command created; a failure against a
+    // pre-existing directory (e.g. "destination must be empty") must never
+    // delete user content.
+    let existed = root.exists();
     if let Err(error) = initialize_project(&root) {
-        if root.exists() {
+        if !existed && root.exists() {
             fs::remove_dir_all(&root)
                 .with_context(|| format!("could not clean failed project {}", root.display()))?;
         }
@@ -510,10 +514,44 @@ fn profile_command(args: Vec<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn editor_command() -> anyhow::Result<()> {
+fn editor_command(args: Vec<String>) -> anyhow::Result<()> {
+    // Split the composition-root option (--project) from the editor's own
+    // flags; everything else forwards verbatim to the editor's parser.
+    let mut project_arg = None;
+    let mut editor_args = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--project" => {
+                index += 1;
+                project_arg =
+                    Some(PathBuf::from(args.get(index).ok_or_else(|| {
+                        anyhow::anyhow!("--project requires a path")
+                    })?));
+            }
+            value => editor_args.push(value.to_string()),
+        }
+        index += 1;
+    }
+    let hot_reload = editor_args.iter().any(|arg| arg == "--hot-reload");
+    let auto_build = !editor_args.iter().any(|arg| arg == "--frames");
+    let plan = resolve_editor_launch(project_arg.as_deref(), &env::current_dir()?, hot_reload)?;
+    // --project is process-wide: from here on every workspace-relative path
+    // (documents, assets, scripts, saves) resolves against the project root.
+    // Running inside the project directory needs no chdir.
+    if let Some(root) = &plan.project_root {
+        env::set_current_dir(root)?;
+    }
+    let profile = plan.profile;
     moni_editor::run(
-        env::args().skip(2).collect(),
-        Box::new(|session, window, hot_reload| {
+        moni_editor::EditorLaunch {
+            profile: profile.clone(),
+            scene_path: plan.scene,
+            project: plan.project,
+            auto_build,
+        },
+        editor_args,
+        Box::new(move |session, window, _hot_reload| {
             // The composition root installs the script runtime so play mode
             // runs game scripts; outside play they stay inert (no ticks).
             session
@@ -521,15 +559,104 @@ fn editor_command() -> anyhow::Result<()> {
                 .set_script_runtime(Box::new(QuickJsScriptRuntime::new()));
             // Registration phase only, with the window attached to the render
             // plugin: scene loading and render startup stay inside the editor
-            // so they run after its event loop has a surface.
-            let profile = Profile::named("editor")?.with_config(
-                "core.render",
-                json!({ "collectGpuTimestamps": true, "hotReload": hot_reload }),
-            );
+            // so they run after its event loop has a surface. The profile is
+            // fully resolved up front (project patches + editor tool plugins
+            // + render config), so the session and the registration agree.
             bootstrap::register_profile(&profile, session.host_mut(), Some(Arc::clone(window)))?;
             Ok(())
         }),
     )
+}
+
+/// Default editor scene in workspace mode (no project detected).
+const DEFAULT_EDITOR_SCENE: &str = "testing/assets/benchmark-3d.mnsc";
+
+/// The resolved editor launch state, produced by [`resolve_editor_launch`]:
+/// the merged profile, the default scene, the detected project, and the
+/// root to chdir into.
+#[derive(Debug)]
+pub(crate) struct EditorLaunchPlan {
+    pub profile: Profile,
+    pub scene: String,
+    pub project: Option<moni_editor::EditorProject>,
+    /// Project root to chdir into (`--project` only; running inside the
+    /// project directory already has the right working directory).
+    pub project_root: Option<PathBuf>,
+}
+
+/// The editor's own tool plugins, force-enabled on top of any base profile:
+/// play mode needs the simulation provider, the viewport needs render (which
+/// pulls FBX assets), and the panels need the editor capability grant.
+const EDITOR_TOOL_PLUGINS: [&str; 4] =
+    ["core.render", "core.editor", "core.simulation", "core.fbx"];
+
+/// Builds the editor profile from a base profile: the base's patches/config
+/// apply first, the tool-enable patches follow (so a project patch disabling
+/// a tool is overridden), and the render config patch comes last (its keys
+/// merge over project config keys, later keys winning).
+fn editor_tool_profile(base: Profile, hot_reload: bool) -> Profile {
+    let mut profile = base;
+    for id in EDITOR_TOOL_PLUGINS {
+        profile = profile.with_patch(id, true);
+    }
+    profile.with_config(
+        "core.render",
+        json!({ "collectGpuTimestamps": true, "hotReload": hot_reload }),
+    )
+}
+
+/// Resolves the editor launch from the command line and the working
+/// directory. With `--project PATH` the project is loaded from that
+/// directory (and the caller chdirs to it); otherwise a `game.mngp` in the
+/// working directory is adopted as-is. Without a project the editor falls
+/// back to workspace mode: the `editor` profile and the benchmark scene.
+/// The editor accepts no `--profile` today, so the project's profile is
+/// always the base.
+pub(crate) fn resolve_editor_launch(
+    project_arg: Option<&Path>,
+    cwd: &Path,
+    hot_reload: bool,
+) -> anyhow::Result<EditorLaunchPlan> {
+    let (project, project_root) = match project_arg {
+        Some(raw) => {
+            let root = if raw.is_absolute() {
+                raw.to_path_buf()
+            } else {
+                cwd.join(raw)
+            };
+            let project = moni_editor::EditorProject::load_at(&root)?;
+            (Some(project), Some(root))
+        }
+        None => {
+            if cwd.join("game.mngp").is_file() {
+                (Some(moni_editor::EditorProject::load_at(cwd)?), None)
+            } else {
+                (None, None)
+            }
+        }
+    };
+    let (profile, scene) = match &project {
+        Some(project) => {
+            // Reload the manifest for the profile merge: two small file reads
+            // at startup, and `load_at` keeps validating before any chdir.
+            let game = project::GameProject::load(&project.root)?;
+            let base = game.profile()?;
+            (
+                editor_tool_profile(base, hot_reload),
+                project.main_scene.clone(),
+            )
+        }
+        None => (
+            editor_tool_profile(Profile::named("editor")?, hot_reload),
+            DEFAULT_EDITOR_SCENE.to_string(),
+        ),
+    };
+    Ok(EditorLaunchPlan {
+        profile,
+        scene,
+        project,
+        project_root,
+    })
 }
 
 fn scene_roundtrip(args: Vec<String>) -> anyhow::Result<()> {
@@ -789,5 +916,148 @@ mod tests {
             "7".to_string(),
         ])
         .expect("fuzz smoke run should not catch parser panics");
+    }
+
+    /// A failed `moni new` against a pre-existing directory must never delete
+    /// user content; only directories the command itself created are cleaned.
+    #[test]
+    fn new_preserves_pre_existing_directories_on_failure() {
+        let root = temp_root("new-preserve");
+        fs::create_dir_all(&root).expect("create target directory");
+        fs::write(root.join("precious.txt"), "keep me").expect("write user file");
+
+        let error = project_new(vec![root.display().to_string()])
+            .expect_err("a non-empty destination must fail");
+        assert!(
+            error.to_string().contains("destination must be empty"),
+            "the error explains the refusal: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("precious.txt")).expect("user file survives"),
+            "keep me",
+            "the pre-existing directory is untouched"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `moni editor` inside a project directory adopts it: the project
+    /// profile (with the editor's tool plugins forced on top) is the base,
+    /// the main scene is the default document scene, and `--project` plans a
+    /// chdir while in-directory detection does not.
+    #[test]
+    fn editor_detection_adopts_project_profile_scene_and_tool_plugins() {
+        let root = temp_root("editor-project");
+        initialize_project(&root).expect("initialize project");
+        let cwd = temp_root("editor-cwd");
+
+        let plan = resolve_editor_launch(Some(&root), &cwd, false).expect("project launch plan");
+        let project = plan.project.as_ref().expect("project detected");
+        assert_eq!(
+            project.name,
+            root.file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .expect("name")
+        );
+        assert_eq!(project.main_scene, "scenes/main.mnsc");
+        assert_eq!(project.profile_name, "default");
+        assert_eq!(project.root, root);
+        assert_eq!(
+            plan.profile.name, "default",
+            "the project profile is the base"
+        );
+        assert_eq!(
+            plan.scene, "scenes/main.mnsc",
+            "the default document scene is the project main scene"
+        );
+        assert_eq!(
+            plan.project_root.as_deref(),
+            Some(root.as_path()),
+            "--project plans the process-wide chdir"
+        );
+        let effective = plan
+            .profile
+            .resolve(&profile::Target::current())
+            .expect("resolve project profile");
+        for id in EDITOR_TOOL_PLUGINS {
+            assert!(
+                effective.contains(id),
+                "the editor forces {id} on the project profile"
+            );
+        }
+
+        // Running inside the project directory needs no chdir.
+        let in_place = resolve_editor_launch(None, &root, false).expect("in-directory detection");
+        assert!(in_place.project.is_some());
+        assert!(in_place.project_root.is_none());
+
+        // Workspace mode: no project, editor profile, benchmark scene.
+        let workspace = resolve_editor_launch(None, &cwd, false).expect("workspace launch plan");
+        assert!(workspace.project.is_none());
+        assert_eq!(workspace.scene, DEFAULT_EDITOR_SCENE);
+        assert_eq!(workspace.profile.name, "editor");
+        assert!(workspace.project_root.is_none());
+
+        // A --project directory without game.mngp is rejected up front.
+        let error = resolve_editor_launch(Some(&cwd), &cwd, false)
+            .expect_err("a non-project directory must be rejected");
+        assert!(
+            error.to_string().contains("game.mngp"),
+            "the error names the missing manifest: {error}"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&cwd);
+    }
+
+    /// The project's patches apply under the forced tool patches: a
+    /// project-disabled core.render is re-enabled for the editor, project
+    /// config survives the merge, and the render config patch carries the
+    /// editor's GPU timestamps plus the hot-reload flag.
+    #[test]
+    fn editor_project_patches_apply_with_tool_plugins_and_render_config() {
+        let root = temp_root("editor-patches");
+        fs::create_dir_all(root.join("scenes")).expect("scenes dir");
+        fs::write(
+            root.join("scenes/main.mnsc"),
+            r#"{"format":"moni-scene","version":2,"name":"patched","entities":[]}"#,
+        )
+        .expect("write scene");
+        fs::write(
+            root.join("game.mngp"),
+            json!({
+                "format": "moni-game-project",
+                "version": 1,
+                "name": "patched",
+                "engine": env!("CARGO_PKG_VERSION"),
+                "profile": "default",
+                "scene": "scenes/main.mnsc",
+                "patches": [
+                    { "plugin": "core.simulation", "config": { "tickRate": 120 } },
+                    { "plugin": "core.render", "enabled": false }
+                ],
+            })
+            .to_string(),
+        )
+        .expect("write game.mngp");
+
+        let plan = resolve_editor_launch(Some(&root), &root, true).expect("launch plan");
+        let effective = plan
+            .profile
+            .resolve(&profile::Target::current())
+            .expect("resolve patched profile");
+        assert!(
+            effective.contains("core.render"),
+            "the editor's tool patch re-enables a project-disabled core.render"
+        );
+        assert_eq!(
+            effective.config_for("core.simulation"),
+            Some(&json!({ "tickRate": 120 })),
+            "the project's config patches survive the merge"
+        );
+        assert_eq!(
+            effective.config_for("core.render"),
+            Some(&json!({ "collectGpuTimestamps": true, "hotReload": true })),
+            "the editor's render config patch carries GPU timestamps and hot reload"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }
