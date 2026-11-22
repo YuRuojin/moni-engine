@@ -44,9 +44,16 @@ moni new my-game
 cd my-game
 moni run
 moni doctor
+moni editor
 moni profile dump
 ```
 
 `moni new` copies `templates/minimal-game/`, sets the project name, writes the lockfile, and initializes an independent Git repository. `moni run` installs locked npm dependencies with `npm ci` when needed, builds TypeScript, and starts the client with the project's profile and `.mnsc` scene.
 
 `run` currently finds templates in the engine installation or source directory. Release distribution must ship templates with the engine rather than relying on a development-machine source path.
+
+## The project in the editor
+
+- `moni editor` run in a directory containing `game.mngp` adopts that project: the session uses the project's declared profile as the base, and the default document scene is the project's main scene (`--scene` still overrides it). The editor then force-enables its own tool plugins (`core.render`, `core.editor`, `core.simulation`, `core.fbx`, overriding project patches that disable them) and appends a render config patch (`collectGpuTimestamps`, `hotReload`); the project's remaining patches/config are preserved in declared order. The editor offers no `--profile` override.
+- `moni editor --project PATH` opens a project from another directory and switches the process working directory **globally** to the project root; from then on every workspace-relative path (documents, assets, scripts, saves) resolves inside it. Running inside the project directory needs no chdir. Opening verifies that `game.mngp` and the main scene file exist.
+- In-panel project open/creation (the `moni new` child process), the recent-projects list (user config directory `.moni/editor-recent.json`), and the Scripts build panel are editor responsibilities — see [`plugins/editor/scene-viewer/`](../plugins/editor/scene-viewer/README_en.md); this document only defines the project format and command semantics.
