@@ -8,6 +8,12 @@
 //! entry stores a label plus inverse/forward command lists, and create/delete
 //! entries carry the full entity snapshot inside a `RestoreEntity` command so
 //! undo/redo keeps stable entity IDs.
+//!
+//! Viewport drags are the one exception to the apply-then-record flow, and
+//! they reuse the same history: `preview_apply` moves the world without
+//! recording while the pointer is down, and the release commits exactly one
+//! entry through `record_external_edit`. There is no second edit-state
+//! system — both paths end in the same memento stacks.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -145,6 +151,43 @@ impl EditorDocument {
         let redo_commands = vec![forward.clone()];
         self.session.apply(forward)?;
         let undo_commands = inverse(self.session.engine());
+        self.push_history(label, undo_commands, redo_commands);
+        Ok(())
+    }
+
+    /// Applies a command through the session WITHOUT recording history:
+    /// the drag-preview path for viewport gizmos. Intermediate previews
+    /// never touch the undo/redo stacks; revision bumps are expected and
+    /// the dirty flag follows the revision as with any session apply.
+    ///
+    /// This exists for viewport drags only — ordinary edits must keep using
+    /// [`EditorDocument::apply`], which is the only path that pairs a
+    /// forward command with an inverse. Guarded by the same play-mode edit
+    /// lock as `apply`, and without a revision check (a drag preview has no
+    /// optimistic-concurrency expectation).
+    pub fn preview_apply(&mut self, command: Command) -> anyhow::Result<()> {
+        self.check_editable()?;
+        self.session.apply(command)?;
+        Ok(())
+    }
+
+    /// Records ONE history entry for edits that were already applied outside
+    /// the normal apply path — the viewport drag commit: the preview
+    /// commands ran through [`EditorDocument::preview_apply`], and at
+    /// release the caller records the whole drag as a single entry whose
+    /// inverse restores the drag-start state. Clears the redo stack like a
+    /// normal apply. No world mutation happens here.
+    ///
+    /// This exists for viewport drags only — ordinary edits must keep using
+    /// [`EditorDocument::apply`]. Guarded by the same play-mode edit lock
+    /// as `apply`.
+    pub fn record_external_edit(
+        &mut self,
+        label: &'static str,
+        undo_commands: Vec<Command>,
+        redo_commands: Vec<Command>,
+    ) -> anyhow::Result<()> {
+        self.check_editable()?;
         self.push_history(label, undo_commands, redo_commands);
         Ok(())
     }

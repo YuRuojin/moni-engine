@@ -856,3 +856,175 @@ fn document_source_never_takes_direct_world_access() {
         "document.rs must edit through RuntimeSession::apply only"
     );
 }
+
+/// Viewport drag semantics: `preview_apply` moves the world without
+/// touching the history stacks (revision bumps and the dirty flag follow
+/// the session as with any apply), and `record_external_edit` commits the
+/// whole drag as exactly one entry that undo/redo walk.
+#[test]
+fn drag_previews_leave_history_alone_and_commit_one_entry() {
+    let scene_path = seed_scene("drag", "document-drag", false);
+    let mut document =
+        EditorDocument::new(session_with_health(HEALTH_VERSION), &scene_path).expect("open");
+    // One normal edit so the undo stack is non-trivial.
+    document
+        .rename_entity(document.session().revision(), 1, "renamed")
+        .expect("rename");
+    let revision = document.session().revision();
+    let start = Transform::default();
+    let moved = Transform {
+        x: 1.5,
+        y: 0.0,
+        rotation: 0.0,
+    };
+
+    // Intermediate previews: revision, dirty state, and world content move;
+    // the stacks do not.
+    for x in [0.5, 1.0, 1.5] {
+        document
+            .preview_apply(Command::SetTransform {
+                entity: 1,
+                transform: Transform {
+                    x,
+                    y: 0.0,
+                    rotation: 0.0,
+                },
+            })
+            .expect("preview");
+    }
+    assert!(
+        document.session().revision() > revision,
+        "previews bump the revision like any session apply"
+    );
+    assert_eq!(document.undo_depth(), 1, "previews never record history");
+    assert_eq!(document.redo_depth(), 0);
+    assert_eq!(document.session().world().entities[&1].transform, moved);
+    assert!(document.is_dirty());
+
+    // Release commit: exactly one additional entry, inverse to the start.
+    document
+        .record_external_edit(
+            "move entity",
+            vec![Command::SetTransform {
+                entity: 1,
+                transform: start,
+            }],
+            vec![Command::SetTransform {
+                entity: 1,
+                transform: moved,
+            }],
+        )
+        .expect("commit");
+    assert_eq!(document.undo_depth(), 2);
+    assert_eq!(document.redo_depth(), 0);
+    assert_eq!(document.undo().expect("undo"), Some("move entity"));
+    assert_eq!(
+        document.session().world().entities[&1].transform,
+        start,
+        "the undo restores the drag-start transform"
+    );
+    assert_eq!(document.redo().expect("redo"), Some("move entity"));
+    assert_eq!(document.session().world().entities[&1].transform, moved);
+    let _ = fs::remove_file(&scene_path);
+}
+
+/// An unchanged drag (snapped back to where it began) restores the start
+/// transform exactly and records nothing; a commit also clears the redo
+/// stack like a normal apply.
+#[test]
+fn unchanged_drag_restores_exactly_and_records_nothing() {
+    let scene_path = seed_scene("drag-restore", "document-drag-restore", false);
+    let mut document =
+        EditorDocument::new(session_with_health(HEALTH_VERSION), &scene_path).expect("open");
+    let start = Transform::default();
+    let moved = Transform {
+        x: 2.0,
+        y: 0.0,
+        rotation: 0.0,
+    };
+
+    // The unchanged-drag path: preview the restore through preview_apply
+    // (the same path the UI uses) and record nothing.
+    document
+        .preview_apply(Command::SetTransform {
+            entity: 1,
+            transform: moved,
+        })
+        .expect("preview");
+    document
+        .preview_apply(Command::SetTransform {
+            entity: 1,
+            transform: start,
+        })
+        .expect("restore");
+    assert_eq!(document.undo_depth(), 0, "nothing was recorded");
+    assert_eq!(document.redo_depth(), 0);
+    assert_eq!(
+        document.session().world().entities[&1].transform,
+        start,
+        "the world is back at the drag-start transform exactly"
+    );
+
+    // A commit clears the redo stack like a normal apply.
+    document
+        .rename_entity(document.session().revision(), 1, "again")
+        .expect("rename");
+    document.undo().expect("undo the rename");
+    assert_eq!(document.redo_depth(), 1);
+    document
+        .record_external_edit(
+            "move entity",
+            vec![Command::SetTransform {
+                entity: 1,
+                transform: start,
+            }],
+            vec![Command::SetTransform {
+                entity: 1,
+                transform: moved,
+            }],
+        )
+        .expect("commit");
+    assert_eq!(document.redo_depth(), 0, "the commit clears the redo stack");
+    assert_eq!(document.undo_depth(), 1);
+    let _ = fs::remove_file(&scene_path);
+}
+
+/// The drag paths respect the play-mode edit lock exactly like `apply`.
+#[test]
+fn play_mode_locks_the_drag_paths() {
+    let scene_path = seed_scene("drag-play", "document-drag-play", false);
+    let mut document = EditorDocument::new(session_for_play(), &scene_path).expect("open");
+    document.enter_play().expect("enter play");
+    let error = document
+        .preview_apply(Command::SetTransform {
+            entity: 1,
+            transform: Transform::default(),
+        })
+        .expect_err("playing documents refuse previews");
+    assert!(error.to_string().contains("playing"), "{error}");
+    let error = document
+        .record_external_edit(
+            "move entity",
+            vec![Command::SetTransform {
+                entity: 1,
+                transform: Transform::default(),
+            }],
+            vec![Command::SetTransform {
+                entity: 1,
+                transform: Transform {
+                    x: 1.0,
+                    y: 0.0,
+                    rotation: 0.0,
+                },
+            }],
+        )
+        .expect_err("playing documents refuse commits");
+    assert!(error.to_string().contains("playing"), "{error}");
+    assert_eq!(
+        document.undo_depth(),
+        0,
+        "the refused commit records nothing"
+    );
+    document.exit_play().expect("exit play");
+    let _ = fs::remove_file(&scene_path);
+}

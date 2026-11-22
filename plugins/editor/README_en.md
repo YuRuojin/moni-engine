@@ -15,7 +15,7 @@ Asset parsing belongs to [`assets/`](../assets/README_en.md), rendered images to
 
 ## Initial official capabilities
 
-Start with the independent project model and read-only scene preview, then add hierarchy, inspectors, and transform editing. Editor controls need stable identities, typed properties, and command mappings so agents can perform operations equivalent to the UI.
+Editor controls need stable identities, typed properties, and command mappings so agents can perform operations equivalent to the UI; [`scene-viewer/`](scene-viewer/README_en.md) already makes panel edits produce the same revisions, events, and saved bytes as the NDJSON command path (guaranteed by document-level tests).
 
 ## Performance and stability
 
@@ -25,6 +25,6 @@ Start with the independent project model and read-only scene preview, then add h
 - Imports, builds, and analysis run in the background with progress, cancellation, and clear errors without blocking the viewport.
 - Unloading a plugin panel must release subscriptions, timers, and file watchers.
 
-## Current limitations
+## Current capabilities and limitations
 
-The [`scene-viewer/`](scene-viewer/README_en.md) read-only viewer loads `.mnsc`, displays entity hierarchy, model resources, lights, and performance overlays, and supports camera movement and zoom. It neither executes scripts nor writes files. Full property editing, project creation, control registration, and undo remain unimplemented.
+[`scene-viewer/`](scene-viewer/README_en.md) is an editable scene editor: project mode (project detection, profile merge, recents), egui panels (hierarchy, inspector, asset browser, script builds), play mode (simulation ticks with the play-mode edit lock), undo/redo and scene persistence, and in-viewport editing (click-select, the move gizmo with snapping, the renderer grid toggle, and mouse camera operations). Rotate/scale gizmos, control registration, and a plugin UI SDK remain unimplemented.

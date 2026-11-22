@@ -15,19 +15,45 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 pub mod document;
+pub mod project;
+pub mod scripts;
 pub mod ui;
 pub mod ui_egui;
+pub mod viewport;
 
 use document::EditorDocument;
 use ui::OverlayCache;
 use ui_egui::EditorUi;
+// Re-exported for the composition root, which resolves the startup project.
+pub use project::EditorProject;
 
 /// Composition hook supplied by the binary: installs the profile's plugins
 /// once the window exists. The editor itself never names a concrete plugin.
 pub type Bootstrap = dyn FnOnce(&mut RuntimeSession, &Arc<Window>, bool) -> anyhow::Result<()>;
 
-pub fn run(args: Vec<String>, bootstrap: Box<Bootstrap>) -> anyhow::Result<()> {
-    let mut scene_path = "testing/assets/benchmark-3d.mnsc".to_string();
+/// Everything the composition root resolves before the event loop starts.
+pub struct EditorLaunch {
+    /// Fully resolved profile: the project's patches/config with the
+    /// editor's tool plugins force-enabled on top, plus the render config
+    /// patch (collectGpuTimestamps, hotReload). Workspace mode resolves the
+    /// `editor` profile instead.
+    pub profile: Profile,
+    /// Default document scene (the project's main scene in project mode);
+    /// a `--scene` argument overrides it.
+    pub scene_path: String,
+    /// The detected project; `None` is workspace mode (no `game.mngp`).
+    pub project: Option<EditorProject>,
+    /// Auto-build TypeScript once when a project opens. Automated runs
+    /// (`--frames`) pass false so captures stay free of npm spawn noise.
+    pub auto_build: bool,
+}
+
+pub fn run(
+    launch: EditorLaunch,
+    args: Vec<String>,
+    bootstrap: Box<Bootstrap>,
+) -> anyhow::Result<()> {
+    let mut scene_path = launch.scene_path;
     let mut golden_path = None;
     let mut frame_limit = 0_u64;
     let mut hot_reload = false;
@@ -69,8 +95,7 @@ pub fn run(args: Vec<String>, bootstrap: Box<Bootstrap>) -> anyhow::Result<()> {
     // the profile registered, so plugin-contributed component schemas
     // participate in scene validation; the editor surface stays 960x540.
     let engine = Engine::new();
-    let profile = Profile::named("editor")?;
-    let mut session = RuntimeSession::new(engine, profile);
+    let mut session = RuntimeSession::new(engine, launch.profile);
     session.world_mut().viewport.width = 960;
     session.world_mut().viewport.height = 540;
     let event_loop = EventLoop::new().context("could not create the editor event loop")?;
@@ -81,6 +106,7 @@ pub fn run(args: Vec<String>, bootstrap: Box<Bootstrap>) -> anyhow::Result<()> {
         frame_limit,
         golden_path,
         hot_reload,
+        launch.project,
         bootstrap,
     );
     event_loop
@@ -89,6 +115,14 @@ pub fn run(args: Vec<String>, bootstrap: Box<Bootstrap>) -> anyhow::Result<()> {
     if let Some(error) = app.failure.take() {
         return Err(error);
     }
+    // The exit summary reports the project the panels actually have open,
+    // falling back to the startup detection (golden mode has no UI).
+    let project_name = app
+        .ui
+        .as_ref()
+        .and_then(|ui| ui.project())
+        .map(|project| project.name.clone())
+        .or_else(|| app.project.as_ref().map(|project| project.name.clone()));
     let document = app
         .document
         .as_mut()
@@ -107,6 +141,8 @@ pub fn run(args: Vec<String>, bootstrap: Box<Bootstrap>) -> anyhow::Result<()> {
             "entities": document.session().world().entities.len(),
             "loadedMeshVertices": loaded_mesh_vertices,
             "goldenCaptured": app.golden_mode,
+            "scene": document.scene_path(),
+            "project": project_name,
         })
     );
     Ok(())
@@ -136,6 +172,10 @@ struct EditorApp {
     ui: Option<EditorUi>,
     golden_mode: bool,
     golden_path: Option<PathBuf>,
+    /// The startup project as detected by the composition root; the panels
+    /// track in-app project opens separately. Kept for the exit summary and
+    /// for golden mode, where no UI exists.
+    project: Option<EditorProject>,
     failure: Option<anyhow::Error>,
     /// Play-mode fixed-step accumulator state, shared semantics with the
     /// windowed client's `advance_simulation`.
@@ -150,6 +190,7 @@ impl EditorApp {
         frame_limit: u64,
         golden_path: Option<PathBuf>,
         hot_reload: bool,
+        project: Option<EditorProject>,
         bootstrap: Box<Bootstrap>,
     ) -> Self {
         Self {
@@ -168,6 +209,7 @@ impl EditorApp {
             ui: None,
             golden_mode: golden_path.is_some(),
             golden_path,
+            project,
             failure: None,
             last_update: Instant::now(),
             accumulator_seconds: 0.0,
@@ -205,6 +247,29 @@ impl EditorApp {
             .map_err(anyhow::Error::new)?;
         self.document = Some(document);
         Ok(())
+    }
+
+    /// Close guard shared by the window button and Escape: a dirty document
+    /// outside play mode raises the Save/Discard/Cancel confirmation through
+    /// the egui UI instead of exiting immediately; the app polls the modal's
+    /// verdict after the frame is submitted. Clean, playing, and golden-mode
+    /// documents close directly (play state is transient and unsavable by
+    /// design, and the `--frames` automation path never shows UI).
+    fn request_close(&mut self, event_loop: &ActiveEventLoop) {
+        let needs_confirmation = !self.golden_mode
+            && self.ui.is_some()
+            && self
+                .document
+                .as_ref()
+                .is_some_and(|document| document.is_dirty() && !document.is_playing());
+        if needs_confirmation {
+            self.ui
+                .as_mut()
+                .expect("ui presence checked above")
+                .request_close_confirmation();
+        } else {
+            event_loop.exit();
+        }
     }
 
     fn camera_input(&mut self, key: &Key) -> bool {
@@ -320,8 +385,16 @@ impl ApplicationHandler for EditorApp {
                         if !self.golden_mode {
                             // egui stays fully disabled in golden mode so the
                             // renderer never receives a UI frame there and
-                            // golden captures remain byte-deterministic.
-                            self.ui = Some(EditorUi::new(Arc::clone(&window)));
+                            // golden captures remain byte-deterministic. The
+                            // auto-build only runs in interactive sessions
+                            // (no --frames), keeping automated captures free
+                            // of npm spawn noise.
+                            let auto_build = self.frame_limit == 0;
+                            self.ui = Some(EditorUi::new(
+                                Arc::clone(&window),
+                                self.project.clone(),
+                                auto_build,
+                            ));
                         }
                         self.window = Some(window);
                     }
@@ -361,10 +434,12 @@ impl ApplicationHandler for EditorApp {
             }
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => self.request_close(event_loop),
             WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
                 if event.logical_key == Key::Named(NamedKey::Escape) {
-                    event_loop.exit();
+                    // Escape is a close request like the window button; a
+                    // dirty document raises the same confirmation.
+                    self.request_close(event_loop);
                 } else if egui_consumed {
                     // egui owns the keyboard (a text field has focus); the
                     // camera navigation yields.
@@ -528,6 +603,12 @@ impl ApplicationHandler for EditorApp {
                         self.failure = Some(anyhow::Error::new(error));
                         event_loop.exit();
                     }
+                }
+                // The confirmation modal hands its verdict to the app here:
+                // Discard, or Save after a successful save, asks for the
+                // exit once the frame carrying the modal is submitted.
+                if !self.golden_mode && self.ui.as_mut().is_some_and(|ui| ui.take_quit_request()) {
+                    event_loop.exit();
                 }
                 window.request_redraw();
             }

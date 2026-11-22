@@ -5,19 +5,142 @@
 //! wgpu renderer composites the UI as its last pass. All edits go through the
 //! document API with the current session revision; rejections surface as an
 //! error line instead of breaking selection or history.
+//!
+//! Viewport interaction (click-to-select, the move gizmo, snapping, the
+//! renderer grid toggle, and mouse camera operations) runs at the
+//! [`Panels::show`] seam over the free central area between the panels and
+//! drives the same document API: drags preview through
+//! `EditorDocument::preview_apply` and commit exactly one undo step through
+//! `EditorDocument::record_external_edit`.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use moni_core::components::{PropertyField, PropertySchema, PropertyType};
-use moni_core::engine::{EntityId, EntitySpec, MAX_SCRIPT_BYTES};
-use moni_core::scene3d::{MeshKind, Model3d, Transform3d};
+use moni_core::engine::{Command, EntityId, EntitySpec, MAX_SCRIPT_BYTES, Transform};
+use moni_core::host::CORE_RENDER;
+use moni_core::scene3d::{Camera3d, MeshKind, Model3d, Transform3d};
 use serde_json::{Value, json};
 use winit::event::WindowEvent;
 use winit::window::Window;
 
 use super::document::EditorDocument;
+use super::project::{self, EditorProject, RecentProject};
+use super::scripts::{self, ScriptBuild};
+use super::viewport::{
+    GIZMO_MODEL_AXIS_LENGTH, GIZMO_SPRITE_AXIS_LENGTH, GizmoTarget, ORBIT_RADIANS_PER_POINT,
+    ViewportSpace, closest_gizmo_axis, effective_snap_step, entity_gizmo_origin,
+    gizmo_axis_segment, orbit_camera, pan_camera, pick_entity, pointer_axis_world_offset,
+    quantize_offset, sprite_axis_segment,
+};
+
+/// The core-registry owner marker; components owned by core are engine
+/// reserved and never offered as attachable dynamic components.
+const CORE_OWNER: &str = "moni.core";
+
+/// Move-gizmo axis colors: X red, Y green, Z blue.
+const GIZMO_COLORS: [egui::Color32; 3] = [
+    egui::Color32::from_rgb(255, 90, 90),
+    egui::Color32::from_rgb(90, 220, 90),
+    egui::Color32::from_rgb(100, 150, 255),
+];
+
+/// The transform a gizmo drag moves, tagged by entity kind so previews and
+/// the commit use the command that actually renders the entity (sprites
+/// follow the entity's 2D transform, models their own 3D transform).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum GizmoTransform {
+    /// Sprite entity: moves the engine 2D transform via `SetTransform`.
+    Sprite(Transform),
+    /// Model entity: moves the model's 3D transform via `SetModelTransform`.
+    Model(Transform3d),
+}
+
+impl GizmoTransform {
+    /// The value shifted by `offset` along the gizmo axis (0 = x, 1 = y,
+    /// 2 = z). Sprite entities have no z; the caller only passes axes the
+    /// target exposes.
+    fn moved_along_axis(self, axis: usize, offset: f64) -> Self {
+        match self {
+            GizmoTransform::Sprite(mut transform) => {
+                if axis == 0 {
+                    transform.x += offset;
+                } else {
+                    transform.y += offset;
+                }
+                GizmoTransform::Sprite(transform)
+            }
+            GizmoTransform::Model(mut transform) => {
+                let component = match axis {
+                    0 => &mut transform.position.x,
+                    1 => &mut transform.position.y,
+                    _ => &mut transform.position.z,
+                };
+                *component += offset;
+                GizmoTransform::Model(transform)
+            }
+        }
+    }
+
+    /// The preview/forward command carrying this transform value.
+    fn command(self, entity: EntityId) -> Command {
+        match self {
+            GizmoTransform::Sprite(transform) => Command::SetTransform { entity, transform },
+            GizmoTransform::Model(transform) => Command::SetModelTransform { entity, transform },
+        }
+    }
+}
+
+/// One in-progress move-gizmo drag: the grabbed axis handle, the transform
+/// snapshot at drag start, the accumulated (unsnapped) offset along the
+/// axis, and the last preview applied — used to skip no-op applies and to
+/// decide the release commit.
+struct GizmoDrag {
+    entity: EntityId,
+    axis: usize,
+    target: GizmoTarget,
+    start: GizmoTransform,
+    offset: f64,
+    applied: Option<GizmoTransform>,
+}
+
+/// A camera mouse drag started inside the viewport (right-drag orbit,
+/// middle-drag pan). Never coexists with a gizmo drag.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CameraDrag {
+    Orbit,
+    Pan,
+}
+
+/// Viewport-interaction state: the gizmo drag, camera mouse drag, grid
+/// visibility, and snapping.
+struct ViewportState {
+    drag: Option<GizmoDrag>,
+    camera_drag: Option<CameraDrag>,
+    /// Renderer grid visibility; pushed to the render API when toggled and
+    /// enabled once at startup (golden mode never constructs this UI, so
+    /// golden captures never touch the flag by construction).
+    grid_visible: bool,
+    grid_initialized: bool,
+    /// Snap toggle and step for gizmo movement; snapping off quantizes to
+    /// whole units (step 1.0).
+    snap_enabled: bool,
+    snap_step: f64,
+}
+
+impl Default for ViewportState {
+    fn default() -> Self {
+        Self {
+            drag: None,
+            camera_drag: None,
+            grid_visible: false,
+            grid_initialized: false,
+            snap_enabled: true,
+            snap_step: 0.25,
+        }
+    }
+}
 
 /// The UI frame payload handed to the render plugin through the type-erased
 /// render API: the frame's tessellated primitives, its texture deltas, and the
@@ -26,9 +149,25 @@ use super::document::EditorDocument;
 /// glyph UVs, so a renderer-side context cannot tessellate correctly.
 pub type EguiFrame = (Vec<egui::ClippedPrimitive>, egui::TexturesDelta, f32);
 
-/// The core-registry owner marker; components owned by core are engine
-/// reserved and never offered as attachable dynamic components.
-const CORE_OWNER: &str = "moni.core";
+/// A deferred action waiting on the unsaved-changes confirmation modal.
+#[derive(Debug, Clone, PartialEq)]
+enum PendingAction {
+    /// Switch the document to another scene.
+    OpenScene(String),
+    /// Move the working directory to a project root and open its main scene.
+    OpenProject(PathBuf),
+    /// Close the editor window (Discard or successful-Save verdict).
+    QuitApp,
+}
+
+/// Project panel state: the current project, the open/new path inputs, and
+/// the cached recent list.
+struct ProjectPanel {
+    current: Option<EditorProject>,
+    open_path: String,
+    new_path: String,
+    recents: Vec<RecentProject>,
+}
 
 /// egui context, winit input bridge, and panel state for the editor UI.
 pub struct EditorUi {
@@ -60,6 +199,17 @@ struct Panels {
     registered_components: Option<(u64, Vec<String>)>,
     /// Workspace asset listing cached by the asset browser panel.
     asset_browser: AssetBrowser,
+    /// Project bar state (current project, open/new inputs, recents).
+    project: ProjectPanel,
+    /// TypeScript build state behind the Scripts panel.
+    scripts: ScriptBuild,
+    /// Viewport interaction: gizmo drag, camera mouse drag, grid, snapping.
+    viewport: ViewportState,
+    /// Action waiting on the unsaved-changes confirmation modal.
+    pending: Option<PendingAction>,
+    /// Exit verdict produced by the confirmation modal; consumed by the
+    /// app loop after the frame is submitted.
+    quit_requested: bool,
 }
 
 impl Default for Panels {
@@ -73,13 +223,28 @@ impl Default for Panels {
             inspector_name: None,
             registered_components: None,
             asset_browser: AssetBrowser::default(),
+            project: ProjectPanel {
+                current: None,
+                open_path: String::new(),
+                new_path: String::new(),
+                recents: Vec::new(),
+            },
+            scripts: ScriptBuild::new(false),
+            viewport: ViewportState::default(),
+            pending: None,
+            quit_requested: false,
         }
     }
 }
 
 impl EditorUi {
     /// Creates the egui context and the winit input bridge for `window`.
-    pub fn new(window: Arc<Window>) -> Self {
+    /// `project` is the startup project detected by the composition root
+    /// (`None` is workspace mode); with one present the recent list is
+    /// seeded and the one-shot auto-build is scheduled when `auto_build`
+    /// says the run is interactive (automated `--frames` runs never spawn
+    /// builds).
+    pub fn new(window: Arc<Window>, project: Option<EditorProject>, auto_build: bool) -> Self {
         let context = egui::Context::default();
         let state = egui_winit::State::new(
             context.clone(),
@@ -89,11 +254,22 @@ impl EditorUi {
             None,
             None,
         );
+        let mut panels = Panels::default();
+        if let Some(project) = &project {
+            panels.project.current = Some(project.clone());
+            panels.record_recent(project);
+            panels.scripts.auto_requested = auto_build;
+        }
+        if panels.project.recents.is_empty()
+            && let Some(config_dir) = project::user_config_dir()
+        {
+            panels.project.recents = project::load_recent_projects(&config_dir);
+        }
         Self {
             window,
             context,
             state,
-            panels: Panels::default(),
+            panels,
         }
     }
 
@@ -113,6 +289,25 @@ impl EditorUi {
     /// simulation failure that exits play mode) on the shared error line.
     pub fn set_error(&mut self, message: String) {
         self.panels.error = Some(message);
+    }
+
+    /// Raises the unsaved-changes confirmation for a window close request.
+    /// A no-op when a confirmation is already pending; the open modal
+    /// handles the close as one of its outcomes.
+    pub fn request_close_confirmation(&mut self) {
+        self.panels.request_quit();
+    }
+
+    /// Consumes the confirmation modal's exit verdict (`Discard`, or `Save`
+    /// after a successful save). True exactly once, checked by the app loop
+    /// after the frame that showed the modal is submitted.
+    pub fn take_quit_request(&mut self) -> bool {
+        std::mem::take(&mut self.panels.quit_requested)
+    }
+
+    /// The project currently open, if any; follows in-app project opens.
+    pub fn project(&self) -> Option<&EditorProject> {
+        self.panels.project.current.as_ref()
     }
 
     /// Runs one egui pass: gathers input, builds the panels against
@@ -137,11 +332,370 @@ impl EditorUi {
 impl Panels {
     fn show(&mut self, ctx: &egui::Context, document: &mut EditorDocument) {
         self.handle_shortcuts(ctx, document);
+        // Drain the build completion channel every frame; a finished build
+        // updates status, output tail, and diagnostics before the panels
+        // render.
+        self.scripts.poll();
+        // The renderer grid is enabled once, on the first UI frame, and
+        // toggled from the toolbar afterwards. Golden mode never constructs
+        // this UI, so golden captures never touch the grid flag by
+        // construction.
+        if !self.viewport.grid_initialized {
+            self.viewport.grid_initialized = true;
+            self.viewport.grid_visible = true;
+            self.apply_grid_visibility(document);
+        }
         ctx.root_ui(|ui| {
             self.show_playback(ui, document);
+            self.show_project(ui, document);
             self.show_hierarchy(ui, document);
             self.show_inspector(ui, document);
             self.show_asset_browser(ui, document);
+            self.show_scripts(ui, document);
+            // Viewport interaction at the panel seam: picking, the move
+            // gizmo, and mouse camera ops drive the same document API from
+            // the free central area the panels leave open.
+            self.show_viewport(ui, document);
+        });
+        // The confirmation modal is a floating egui window, so it renders
+        // outside root_ui and can take over after any panel raised a
+        // pending action this frame.
+        self.show_confirmation_modal(ctx, document);
+    }
+
+    /// Raises the unsaved-changes modal for a window close request. A no-op
+    /// when a confirmation is already pending (the open modal handles the
+    /// close as one of its outcomes).
+    fn request_quit(&mut self) {
+        self.pending.get_or_insert(PendingAction::QuitApp);
+    }
+
+    /// Runs the action the user confirmed in the modal. The pending entry
+    /// is consumed first so a failure inside the action cannot loop the
+    /// modal; failures surface on the error line and the document stays as
+    /// it was.
+    fn perform_pending(&mut self, document: &mut EditorDocument) {
+        let Some(action) = self.pending.take() else {
+            return;
+        };
+        match action {
+            PendingAction::OpenScene(path) => self.perform_scene_open(document, &path),
+            PendingAction::OpenProject(root) => self.perform_project_open(document, &root),
+            PendingAction::QuitApp => self.quit_requested = true,
+        }
+    }
+
+    /// The unsaved-changes confirmation modal (a plain egui window):
+    /// Save runs the document save and only proceeds on success, Discard
+    /// proceeds without saving, Cancel aborts the pending action. A failed
+    /// save keeps the modal open with the error surfaced.
+    fn show_confirmation_modal(&mut self, ctx: &egui::Context, document: &mut EditorDocument) {
+        if self.pending.is_none() {
+            return;
+        }
+        egui::Window::new("Unsaved changes")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label("The current scene has unsaved changes.");
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        match document.save() {
+                            Ok(()) => {
+                                self.error = None;
+                                self.perform_pending(document);
+                            }
+                            Err(error) => {
+                                self.error = Some(format!(
+                                    "save failed: {error:#} — fix it or choose Discard/Cancel"
+                                ));
+                            }
+                        }
+                    }
+                    if ui.button("Discard").clicked() {
+                        self.perform_pending(document);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.pending = None;
+                    }
+                });
+            });
+    }
+
+    /// Scene switches from the asset browser: while the document is dirty
+    /// the unsaved-changes modal intercepts the attempt and proceeds (or
+    /// aborts) through the modal's Save/Discard/Cancel; while playing the
+    /// document's play lock refuses through the guarded path.
+    fn request_scene_open(&mut self, document: &mut EditorDocument, path: &str) {
+        if document.is_playing() {
+            self.perform_scene_open(document, path);
+            return;
+        }
+        if document.is_dirty() {
+            self.pending
+                .get_or_insert(PendingAction::OpenScene(path.to_string()));
+            return;
+        }
+        self.perform_scene_open(document, path);
+    }
+
+    fn perform_scene_open(&mut self, document: &mut EditorDocument, path: &str) {
+        match document.open_scene(path) {
+            Ok(()) => self.error = None,
+            Err(error) => self.error = Some(format!("open scene failed: {error:#}")),
+        }
+    }
+
+    /// Opens a project from the UI (input field, New flow, or recents).
+    /// Playing documents refuse first (play state is transient); dirty
+    /// documents route through the unsaved-changes modal first.
+    fn request_project_open(&mut self, document: &mut EditorDocument, root: &PathBuf) {
+        if document.is_playing() {
+            self.error = Some("stop play mode before opening a project".to_string());
+            return;
+        }
+        if document.is_dirty() {
+            self.pending
+                .get_or_insert(PendingAction::OpenProject(root.clone()));
+            return;
+        }
+        self.perform_project_open(document, root);
+    }
+
+    /// The verified open flow: load and validate the project, move the
+    /// process working directory to the project root (process-wide: every
+    /// workspace-relative path — documents, assets, scripts, saves —
+    /// resolves against the root from here on), then rebuild the document
+    /// through the guarded `open_scene` path with the project's main scene.
+    /// On success the project bar, recent list, and one auto-build request
+    /// are updated. A failed scene open after the chdir surfaces the error
+    /// and keeps the document on its previous scene.
+    fn perform_project_open(&mut self, document: &mut EditorDocument, root: &PathBuf) {
+        let project = match project::EditorProject::load_at(root) {
+            Ok(project) => project,
+            Err(error) => {
+                self.error = Some(format!("open project failed: {error:#}"));
+                return;
+            }
+        };
+        if let Err(error) = std::env::set_current_dir(&project.root) {
+            self.error = Some(format!(
+                "could not enter the project root {}: {error}",
+                project.root.display()
+            ));
+            return;
+        }
+        match document.open_scene(&project.main_scene) {
+            Ok(()) => {
+                self.error = None;
+                self.project.current = Some(project.clone());
+                self.project.open_path.clear();
+                self.record_recent(&project);
+                self.scripts.auto_requested = true;
+            }
+            Err(error) => {
+                self.error = Some(format!("open project scene failed: {error:#}"));
+            }
+        }
+    }
+
+    /// Creates a project through the isolated `moni new` child process and
+    /// opens it. The path is absolutized against the current directory
+    /// before the child runs, so the created location is unambiguous
+    /// regardless of the child's working directory.
+    fn perform_new_project(&mut self, document: &mut EditorDocument, raw: &str) {
+        if raw.is_empty() {
+            self.error = Some("enter a directory path for the new project".to_string());
+            return;
+        }
+        let root = match std::env::current_dir() {
+            Ok(cwd) => cwd.join(raw),
+            Err(error) => {
+                self.error = Some(format!("could not read the working directory: {error}"));
+                return;
+            }
+        };
+        if let Err(error) = project::spawn_new_project(&root) {
+            self.error = Some(format!("new project failed: {error:#}"));
+            return;
+        }
+        self.request_project_open(document, &root);
+    }
+
+    /// Records a successfully opened project in the persisted recent list
+    /// and refreshes the panel cache. Failures (no user config directory,
+    /// unwritable file) surface on the error line without blocking.
+    fn record_recent(&mut self, project: &EditorProject) {
+        let Some(config_dir) = project::user_config_dir() else {
+            return;
+        };
+        match project::record_recent_project(
+            &config_dir,
+            &project.root.to_string_lossy(),
+            &project.name,
+        ) {
+            Ok(recents) => {
+                self.project.recents = recents;
+                self.error = None;
+            }
+            Err(error) => {
+                self.error = Some(format!("could not record the recent project: {error:#}"))
+            }
+        }
+    }
+
+    /// Project bar: the current project (or workspace mode), open/new
+    /// project inputs, and the recent list.
+    fn show_project(&mut self, ui: &mut egui::Ui, document: &mut EditorDocument) {
+        egui::Panel::top("project_panel").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("Project");
+                match &self.project.current {
+                    Some(current) => {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} ({})",
+                                current.name, current.profile_name
+                            ))
+                            .strong(),
+                        );
+                        ui.label(current.root.display().to_string()).on_hover_text(
+                            "project mode: workspace-relative paths resolve against this root",
+                        );
+                    }
+                    None => {
+                        ui.label("no project — workspace mode");
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.project.open_path)
+                        .desired_width(220.0)
+                        .hint_text("path to a project directory"),
+                );
+                if ui.button("Open project...").clicked() {
+                    let path = self.project.open_path.trim().to_string();
+                    if path.is_empty() {
+                        self.error = Some("enter a project directory path".to_string());
+                    } else {
+                        self.request_project_open(document, &PathBuf::from(path));
+                    }
+                }
+                ui.separator();
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.project.new_path)
+                        .desired_width(220.0)
+                        .hint_text("new project directory"),
+                );
+                if ui.button("New project...").clicked() {
+                    let path = self.project.new_path.trim().to_string();
+                    self.perform_new_project(document, &path);
+                }
+            });
+            if !self.project.recents.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Recent:");
+                    for entry in self.project.recents.clone() {
+                        if ui
+                            .small_button(&entry.name)
+                            .on_hover_text(&entry.path)
+                            .clicked()
+                        {
+                            self.request_project_open(document, &PathBuf::from(&entry.path));
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    /// Scripts panel: one `npm run build` per request in the project or
+    /// workspace root with non-blocking output capture, the parsed tsc
+    /// diagnostics with Locate buttons, and a bounded raw-output tail. A
+    /// failed build is never fatal; the engine also validates scene scripts
+    /// at load time, so a failed build explains scenes whose scripts refuse
+    /// to load.
+    fn show_scripts(&mut self, ui: &mut egui::Ui, document: &mut EditorDocument) {
+        egui::Panel::bottom("scripts_panel").show(ui, |ui| {
+            // Consume the auto-build request raised when a project opened.
+            if self.scripts.auto_requested {
+                self.scripts.auto_requested = false;
+                match std::env::current_dir() {
+                    Ok(root) => self.scripts.request(&root),
+                    Err(error) => {
+                        self.scripts.status =
+                            Some(format!("could not read the working directory: {error}"))
+                    }
+                }
+            }
+            ui.horizontal(|ui| {
+                ui.heading("Scripts");
+                if ui
+                    .add_enabled(!self.scripts.is_running(), egui::Button::new("Build"))
+                    .clicked()
+                {
+                    match std::env::current_dir() {
+                        Ok(root) => self.scripts.request(&root),
+                        Err(error) => {
+                            self.error =
+                                Some(format!("could not read the working directory: {error}"))
+                        }
+                    }
+                }
+                if self.scripts.is_running() {
+                    ui.colored_label(egui::Color32::YELLOW, "building...");
+                } else if let Some(status) = &self.scripts.status {
+                    ui.label(status);
+                }
+                ui.label(format!("{} diagnostic(s)", self.scripts.diagnostics.len()));
+            });
+            if !self.scripts.diagnostics.is_empty() {
+                ui.label(egui::RichText::new("Diagnostics").strong());
+                // Cloned per frame: the Locate handler mutates panel state
+                // while the list is being shown.
+                let diagnostics = self.scripts.diagnostics.clone();
+                egui::ScrollArea::vertical()
+                    .max_height(90.0)
+                    .show(ui, |ui| {
+                        for (index, diagnostic) in diagnostics.iter().enumerate() {
+                            ui.push_id(format!("diagnostic-{index}"), |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(255, 110, 110),
+                                        format!(
+                                            "{}:{}:{} {}: {}",
+                                            diagnostic.file,
+                                            diagnostic.line,
+                                            diagnostic.col,
+                                            diagnostic.code,
+                                            diagnostic.message
+                                        ),
+                                    );
+                                    // Locate appears only when an entity's
+                                    // script source references the file;
+                                    // ownerless errors stay non-clickable.
+                                    if let Some(entity) = scripts::find_entity_by_script_source(
+                                        document.session().world(),
+                                        &diagnostic.file,
+                                    ) && ui.small_button("Locate").clicked()
+                                    {
+                                        document.select([entity]);
+                                        self.error = None;
+                                    }
+                                });
+                            });
+                        }
+                    });
+            }
+            if !self.scripts.output_tail.is_empty() {
+                ui.label(egui::RichText::new("Build output").strong());
+                egui::ScrollArea::vertical()
+                    .max_height(90.0)
+                    .show(ui, |ui| {
+                        ui.monospace(&self.scripts.output_tail);
+                    });
+            }
         });
     }
 
@@ -241,8 +795,399 @@ impl Panels {
                 }
                 ui.label(format!("tick {}", document.session().world().tick));
                 ui.label("(Space toggles play)");
+                ui.separator();
+                if ui
+                    .checkbox(&mut self.viewport.grid_visible, "Grid")
+                    .on_hover_text("toggle the renderer's floor grid")
+                    .changed()
+                {
+                    self.apply_grid_visibility(document);
+                }
+                ui.separator();
+                ui.checkbox(&mut self.viewport.snap_enabled, "Snap")
+                    .on_hover_text(
+                        "quantize gizmo movement to the snap step; off quantizes to whole units",
+                    );
+                ui.add(
+                    egui::DragValue::new(&mut self.viewport.snap_step)
+                        .speed(0.05)
+                        .range(0.05..=8.0)
+                        .prefix("step "),
+                )
+                .on_hover_text("snap step in world units");
             });
         });
+    }
+
+    /// Pushes the grid visibility flag to the render provider. A missing
+    /// render provider simply keeps the UI flag; the next toggle retries.
+    fn apply_grid_visibility(&mut self, document: &mut EditorDocument) {
+        let visible = self.viewport.grid_visible;
+        if let Some(render) = document
+            .session_mut()
+            .host_mut()
+            .render_api_mut(CORE_RENDER)
+        {
+            render.set_grid_visible(visible);
+        }
+    }
+
+    /// Viewport interaction over the free central area between the panels:
+    /// click-to-select, the move gizmo with snapping, and mouse camera
+    /// operations. The scene fills the whole window behind the panels, so
+    /// 3D projection uses the egui screen size while the sprite overlay
+    /// maps through the renderer's `world.viewport` space. A gizmo drag
+    /// holds the pointer exclusively; camera drags and picking never run
+    /// alongside it.
+    fn show_viewport(&mut self, ui: &mut egui::Ui, document: &mut EditorDocument) {
+        let Some(screen_rect) = ui.ctx().input(|input| input.raw.screen_rect) else {
+            return;
+        };
+        let screen_size = (screen_rect.width(), screen_rect.height());
+        let viewport_rect = ui.available_rect_before_wrap();
+        let space = ViewportSpace {
+            screen_size,
+            sprite_size: (
+                document.session().world().viewport.width as f32,
+                document.session().world().viewport.height as f32,
+            ),
+        };
+        let camera = document.session().world().camera.clone();
+        let playing = document.is_playing();
+
+        if self.viewport.drag.is_some() {
+            // An active gizmo drag owns the pointer until release.
+            self.update_gizmo_drag(ui.ctx(), document, &camera, screen_size, space);
+        } else {
+            self.update_camera_drag(ui.ctx(), document, &camera, screen_size, viewport_rect);
+            self.update_click_selection(
+                ui.ctx(),
+                document,
+                &camera,
+                screen_size,
+                space,
+                viewport_rect,
+                playing,
+            );
+        }
+        self.draw_gizmo(
+            ui,
+            document,
+            &camera,
+            screen_size,
+            space,
+            viewport_rect,
+            playing,
+        );
+    }
+
+    /// Continues the active move-gizmo drag: the pointer delta is converted
+    /// into movement along the dragged axis (snap-quantized on the
+    /// accumulated offset), previewed through the document with history
+    /// untouched, and on release committed as exactly one undo step — or,
+    /// when the drag ended where it began, restored exactly and recorded
+    /// not at all.
+    fn update_gizmo_drag(
+        &mut self,
+        ctx: &egui::Context,
+        document: &mut EditorDocument,
+        camera: &Camera3d,
+        screen_size: (f32, f32),
+        space: ViewportSpace,
+    ) {
+        let pointer_delta = ctx.input(|input| input.pointer.delta());
+        let released = ctx.input(|input| {
+            input.pointer.button_released(egui::PointerButton::Primary) || !input.pointer.any_down()
+        });
+        let Some(drag) = self.viewport.drag.as_mut() else {
+            return;
+        };
+        let (entity, axis, target) = (drag.entity, drag.axis, drag.target);
+
+        // The entity (or its rendered transform) may have vanished mid-drag
+        // through delete or undo; the drag then ends without a commit.
+        let Some((origin, current_target)) = document
+            .session()
+            .world()
+            .entities
+            .get(&entity)
+            .and_then(entity_gizmo_origin)
+        else {
+            self.viewport.drag = None;
+            return;
+        };
+        if current_target != target {
+            self.viewport.drag = None;
+            return;
+        }
+
+        if !released {
+            // World-axis movement for models, sprite-space movement for
+            // sprites: both convert this frame's pointer delta into units
+            // of the transform the gizmo moves.
+            let delta_world = match target {
+                GizmoTarget::Sprite => {
+                    let (dx, dy) = space.sprite_delta(pointer_delta.x, pointer_delta.y);
+                    if axis == 0 { dx as f64 } else { dy as f64 }
+                }
+                GizmoTarget::Model => pointer_axis_world_offset(
+                    camera,
+                    screen_size,
+                    origin,
+                    axis,
+                    GIZMO_MODEL_AXIS_LENGTH,
+                    (pointer_delta.x, pointer_delta.y),
+                ) as f64,
+            };
+            drag.offset += delta_world;
+            let step = effective_snap_step(self.viewport.snap_enabled, self.viewport.snap_step);
+            let snapped = quantize_offset(drag.offset as f32, step) as f64;
+            let candidate = drag.start.moved_along_axis(axis, snapped);
+            // Apply only when the candidate differs from what the world
+            // currently shows (the last preview, or the start): a silent
+            // frame must not bump the revision.
+            let current = drag.applied.unwrap_or(drag.start);
+            if candidate != current {
+                match document.preview_apply(candidate.command(entity)) {
+                    Ok(()) => drag.applied = Some(candidate),
+                    Err(error) => self.error = Some(format!("move preview failed: {error:#}")),
+                }
+            }
+            return;
+        }
+
+        // Release: exactly one undo step, or an exact restore with nothing
+        // recorded when the drag ended where it began.
+        let drag = self.viewport.drag.take().expect("drag checked above");
+        let final_transform = drag.applied.unwrap_or(drag.start);
+        if final_transform != drag.start {
+            let undo_commands = vec![drag.start.command(entity)];
+            let redo_commands = vec![final_transform.command(entity)];
+            match document.record_external_edit("move entity", undo_commands, redo_commands) {
+                Ok(()) => self.error = None,
+                Err(error) => self.error = Some(format!("move commit failed: {error:#}")),
+            }
+        } else if drag.applied.is_some() {
+            if let Err(error) = document.preview_apply(drag.start.command(entity)) {
+                self.error = Some(format!("move restore failed: {error:#}"));
+            }
+        }
+    }
+
+    /// Mouse camera operations: right-drag orbits around the camera target,
+    /// middle-drag pans in the camera plane — applied through the same
+    /// session command path as the keyboard camera ops. Drags start only on
+    /// a fresh press inside the viewport rect and end when their button is
+    /// released; the caller guarantees no gizmo drag is active.
+    fn update_camera_drag(
+        &mut self,
+        ctx: &egui::Context,
+        document: &mut EditorDocument,
+        camera: &Camera3d,
+        screen_size: (f32, f32),
+        viewport_rect: egui::Rect,
+    ) {
+        let pointer_pos = ctx.input(|input| input.pointer.interact_pos());
+        let delta = ctx.input(|input| input.pointer.delta());
+        let orbit_started =
+            ctx.input(|input| input.pointer.button_pressed(egui::PointerButton::Secondary));
+        let pan_started =
+            ctx.input(|input| input.pointer.button_pressed(egui::PointerButton::Middle));
+        let orbit_held =
+            ctx.input(|input| input.pointer.button_down(egui::PointerButton::Secondary));
+        let pan_held = ctx.input(|input| input.pointer.button_down(egui::PointerButton::Middle));
+
+        if let Some(mode) = self.viewport.camera_drag {
+            let held = match mode {
+                CameraDrag::Orbit => orbit_held,
+                CameraDrag::Pan => pan_held,
+            };
+            if !held {
+                self.viewport.camera_drag = None;
+            }
+        }
+        if self.viewport.camera_drag.is_none()
+            && (orbit_started || pan_started)
+            && pointer_pos.is_some_and(|pos| viewport_rect.contains(pos))
+        {
+            self.viewport.camera_drag = Some(if orbit_started {
+                CameraDrag::Orbit
+            } else {
+                CameraDrag::Pan
+            });
+        }
+        let Some(mode) = self.viewport.camera_drag else {
+            return;
+        };
+        if delta.x == 0.0 && delta.y == 0.0 {
+            return;
+        }
+        // Dragging right turns the view right and dragging up raises the
+        // camera (grab conventions), so orbit deltas negate the pointer.
+        let moved = match mode {
+            CameraDrag::Orbit => orbit_camera(
+                camera,
+                -delta.x * ORBIT_RADIANS_PER_POINT,
+                -delta.y * ORBIT_RADIANS_PER_POINT,
+            ),
+            CameraDrag::Pan => pan_camera(camera, delta.x, delta.y, screen_size.1),
+        };
+        if let Some(moved) = moved
+            && let Err(error) = document
+                .session_mut()
+                .apply(Command::SetCamera { camera: moved })
+        {
+            self.error = Some(format!("camera move failed: {error:#}"));
+        }
+    }
+
+    /// Left-click inside the viewport: grab a gizmo axis handle of the
+    /// single selected entity when the pointer is near one, otherwise pick
+    /// the entity under the pointer. Selection is document state, so the
+    /// hierarchy tree follows automatically; empty space clears it.
+    fn update_click_selection(
+        &mut self,
+        ctx: &egui::Context,
+        document: &mut EditorDocument,
+        camera: &Camera3d,
+        screen_size: (f32, f32),
+        space: ViewportSpace,
+        viewport_rect: egui::Rect,
+        playing: bool,
+    ) {
+        let pressed = ctx.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary));
+        if !pressed {
+            return;
+        }
+        let Some(pos) = ctx.input(|input| input.pointer.interact_pos()) else {
+            return;
+        };
+        if !viewport_rect.contains(pos) {
+            return;
+        }
+        // A widget holding the pointer (a dragged DragValue moved over the
+        // viewport, an open combo box) keeps its interaction.
+        if ctx.egui_wants_pointer_input() {
+            return;
+        }
+        // Gizmo handles win over picking: grabbing an axis must not
+        // deselect or reselect.
+        if !playing
+            && self.try_start_gizmo_drag(document, camera, screen_size, space, (pos.x, pos.y))
+        {
+            return;
+        }
+        match pick_entity(document.session().world(), camera, space, pos.x, pos.y) {
+            Some(entity) => document.select([entity]),
+            None => document.clear_selection(),
+        }
+    }
+
+    /// Starts a move-gizmo drag when the pointer presses near an axis
+    /// handle of the single selected entity. Returns true when a drag
+    /// started.
+    fn try_start_gizmo_drag(
+        &mut self,
+        document: &mut EditorDocument,
+        camera: &Camera3d,
+        screen_size: (f32, f32),
+        space: ViewportSpace,
+        pointer: (f32, f32),
+    ) -> bool {
+        if document.selection().len() != 1 {
+            return false;
+        }
+        let Some(&entity) = document.selection().iter().next() else {
+            return false;
+        };
+        let Some((origin, target)) = document
+            .session()
+            .world()
+            .entities
+            .get(&entity)
+            .and_then(entity_gizmo_origin)
+        else {
+            return false;
+        };
+        let segments = gizmo_screen_segments(target, origin, camera, screen_size, space);
+        let Some(axis) = closest_gizmo_axis(&segments, pointer) else {
+            return false;
+        };
+        let Some(start) = gizmo_transform_of(document, entity, target) else {
+            return false;
+        };
+        self.viewport.drag = Some(GizmoDrag {
+            entity,
+            axis,
+            target,
+            start,
+            offset: 0.0,
+            applied: None,
+        });
+        true
+    }
+
+    /// Draws the move gizmo for the single selected entity: colored axis
+    /// segments with arrowheads over the viewport, brighter while hovered
+    /// or dragged. Hidden while playing (drags are refused there), for
+    /// empty or multi selections, and when the entity has no rendered
+    /// transform.
+    fn draw_gizmo(
+        &mut self,
+        ui: &mut egui::Ui,
+        document: &mut EditorDocument,
+        camera: &Camera3d,
+        screen_size: (f32, f32),
+        space: ViewportSpace,
+        viewport_rect: egui::Rect,
+        playing: bool,
+    ) {
+        if playing || document.selection().len() != 1 {
+            return;
+        }
+        let Some(&entity) = document.selection().iter().next() else {
+            return;
+        };
+        let Some((origin, target)) = document
+            .session()
+            .world()
+            .entities
+            .get(&entity)
+            .and_then(entity_gizmo_origin)
+        else {
+            return;
+        };
+        let segments = gizmo_screen_segments(target, origin, camera, screen_size, space);
+        let pointer_pos = ui.ctx().input(|input| input.pointer.interact_pos());
+        let hovered_axis = match (&self.viewport.drag, pointer_pos) {
+            (Some(drag), _) => Some(drag.axis),
+            (None, Some(pos)) if viewport_rect.contains(pos) => {
+                closest_gizmo_axis(&segments, (pos.x, pos.y))
+            }
+            _ => None,
+        };
+        let painter = ui.painter_at(viewport_rect);
+        for &(axis, (a, b)) in &segments {
+            let active = self
+                .viewport
+                .drag
+                .as_ref()
+                .is_some_and(|drag| drag.entity == entity && drag.axis == axis);
+            let hovered = hovered_axis == Some(axis) && !active;
+            let width = if active {
+                3.5
+            } else if hovered {
+                3.0
+            } else {
+                2.0
+            };
+            let color = GIZMO_COLORS[axis];
+            painter.line_segment(
+                [egui::pos2(a.0, a.1), egui::pos2(b.0, b.1)],
+                egui::Stroke::new(width, color),
+            );
+            draw_arrowhead(&painter, a, b, color);
+        }
     }
 
     /// Entity list with create, per-entity delete, and rename; clicking a row
@@ -654,12 +1599,9 @@ impl Panels {
                         ui.horizontal(|ui| {
                             ui.label(&entry.name).on_hover_text(&entry.path);
                             if ui.small_button("Open").clicked() {
-                                match document.open_scene(&entry.path) {
-                                    Ok(()) => self.error = None,
-                                    Err(error) => {
-                                        self.error = Some(format!("open scene failed: {error:#}"))
-                                    }
-                                }
+                                // Dirty documents route through the
+                                // unsaved-changes modal before the switch.
+                                self.request_scene_open(document, &entry.path);
                             }
                         });
                     }
@@ -788,6 +1730,82 @@ impl Panels {
             ui.colored_label(egui::Color32::from_rgb(255, 110, 110), error);
         }
     }
+}
+
+/// Screen-space segments of the gizmo axes for `target`: models project
+/// through the camera, sprites map from the renderer's sprite space.
+fn gizmo_screen_segments(
+    target: GizmoTarget,
+    origin: [f32; 3],
+    camera: &Camera3d,
+    screen_size: (f32, f32),
+    space: ViewportSpace,
+) -> Vec<(usize, ((f32, f32), (f32, f32)))> {
+    match target {
+        GizmoTarget::Model => target
+            .axes()
+            .iter()
+            .filter_map(|&axis| {
+                gizmo_axis_segment(camera, screen_size, origin, axis, GIZMO_MODEL_AXIS_LENGTH)
+                    .map(|segment| (axis, segment))
+            })
+            .collect(),
+        GizmoTarget::Sprite => {
+            let origin_screen = space.screen_point(origin[0], origin[1]);
+            target
+                .axes()
+                .iter()
+                .map(|&axis| {
+                    (
+                        axis,
+                        sprite_axis_segment(origin_screen, axis, GIZMO_SPRITE_AXIS_LENGTH),
+                    )
+                })
+                .collect()
+        }
+    }
+}
+
+/// The transform a gizmo drag moves for `entity`, as the target kind says.
+fn gizmo_transform_of(
+    document: &EditorDocument,
+    entity: EntityId,
+    target: GizmoTarget,
+) -> Option<GizmoTransform> {
+    let entity = document.session().world().entities.get(&entity)?;
+    match target {
+        GizmoTarget::Model => Some(GizmoTransform::Model(entity.model.as_ref()?.transform)),
+        GizmoTarget::Sprite => Some(GizmoTransform::Sprite(entity.transform)),
+    }
+}
+
+/// Two short segments forming an arrowhead at the tip of the `a` -> `b`
+/// segment.
+fn draw_arrowhead(painter: &egui::Painter, a: (f32, f32), b: (f32, f32), color: egui::Color32) {
+    let dx = b.0 - a.0;
+    let dy = b.1 - a.1;
+    let length = (dx * dx + dy * dy).sqrt();
+    if length < 1.0 {
+        return;
+    }
+    let unit = (dx / length, dy / length);
+    let perp = (-unit.1, unit.0);
+    let base = (b.0 - unit.0 * 10.0, b.1 - unit.1 * 10.0);
+    let stroke = egui::Stroke::new(2.0, color);
+    painter.line_segment(
+        [
+            egui::pos2(b.0, b.1),
+            egui::pos2(base.0 + perp.0 * 4.0, base.1 + perp.1 * 4.0),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(b.0, b.1),
+            egui::pos2(base.0 - perp.0 * 4.0, base.1 - perp.1 * 4.0),
+        ],
+        stroke,
+    );
 }
 
 /// One transform field: a drag value whose edit reaches the document on
